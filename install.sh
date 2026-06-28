@@ -171,7 +171,7 @@ case " $DISTRO_ID $DISTRO_LIKE " in
     *arch*|*manjaro*|*endeavouros*|*garuda*|*cachyos*)
         PKG_INSTALL="sudo pacman -S --noconfirm --needed"; PKG_UPDATE="sudo pacman -Sy"
         PKG_LIST="python python-pip git curl" ;;
-    *suse*|*opensuse*|*sles*)
+    *suse*|*sles*)
         PKG_INSTALL="sudo zypper -n install"; PKG_UPDATE="sudo zypper -n refresh"
         PKG_LIST="python3 python3-pip git curl" ;;
     *alpine*)
