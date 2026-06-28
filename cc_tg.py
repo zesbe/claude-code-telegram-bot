@@ -1538,8 +1538,9 @@ def _build_provider_kb(cid: int) -> dict:
     rows = []
     row = []
     cur = _win_provider(cid)   # highlight = provider window AKTIF, bukan global
-    # "claude" = native default (tak ada di providers.json) → selalu tampil.
-    for name in ["claude"] + sorted(PROVIDERS.keys()):
+    # "claude" = native default (selalu pertama). PROVIDERS juga punya 'claude'
+    # via setdefault (line ~189) → exclude dari sorted biar tombolnya TIDAK dobel.
+    for name in ["claude"] + sorted(n for n in PROVIDERS.keys() if n != "claude"):
         marker = "✅ " if name == cur else "🔌 "
         row.append({"text": f"{marker}{name}", "callback_data": f"pvmgr:{name}"})
         if len(row) == 2:
