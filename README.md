@@ -5,6 +5,7 @@
 **Kendalikan [Claude Code](https://docs.claude.com/en/docs/claude-code) dari Telegram.**
 Chat dari HP, Claude Code yang ngerjain di server kamu — coding, baca/edit file, jalanin command, semuanya.
 
+[![CI](https://github.com/zesbe/claude-code-telegram-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/zesbe/claude-code-telegram-bot/actions/workflows/ci.yml)
 [![shell](https://img.shields.io/badge/install-one--liner-22c55e?logo=gnubash&logoColor=white)](#-instalasi)
 [![python](https://img.shields.io/badge/python-3.10%2B-3776ab?logo=python&logoColor=white)](#prasyarat)
 [![platform](https://img.shields.io/badge/linux-Fedora%20·%20Ubuntu%20·%20Mint%20·%20Arch%20·%20openSUSE-orange?logo=linux&logoColor=white)](#-instalasi)
