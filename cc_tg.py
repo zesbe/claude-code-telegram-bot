@@ -607,9 +607,12 @@ def _format_mdv2(content: str) -> str:
     text = re.sub(r'\[([^\]]+)\]\(([^()\s]+)\)',
                   lambda m: _ph(f'[{_esc_mdv2(m.group(1))}]({m.group(2)})'), text)
     # 4) heading (## Judul) → *Judul* bold
-    text = re.sub(r'^#{1,6}\s+(.+)$',
-                  lambda m: _ph(f'*{_esc_mdv2(re.sub(r"\*\*(.+?)\*\*", r"\1", m.group(1).strip()))}*'),
-                  text, flags=re.MULTILINE)
+    def _heading(m):
+        # strip **bold** di dalam heading dulu (regex dipisah dari f-string biar
+        # tak ada backslash dalam expression → kompatibel Python 3.10/3.11)
+        inner = re.sub(r"\*\*(.+?)\*\*", r"\1", m.group(1).strip())
+        return _ph(f'*{_esc_mdv2(inner)}*')
+    text = re.sub(r'^#{1,6}\s+(.+)$', _heading, text, flags=re.MULTILINE)
     # 5) bullet '- ' / '* ' di awal baris → '• ' (rapi, bukan '⦁'/escaped)
     text = re.sub(r'^(\s*)[-*]\s+', lambda m: m.group(1) + _ph('•') + ' ', text, flags=re.MULTILINE)
     # 6) bold **x** → *x*
