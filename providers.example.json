@@ -1,0 +1,11 @@
+{
+  "providers": {
+    "namaprovider": {
+      "base_url": "https://api.contoh.com/anthropic",
+      "token": "<ISI_SENDIRI>",
+      "opus": "model-pinter",
+      "sonnet": "model-sedang",
+      "haiku": "model-cepat"
+    }
+  }
+}

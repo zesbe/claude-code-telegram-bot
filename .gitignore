@@ -1,0 +1,46 @@
+# Secrets — JANGAN di-push
+config.json
+providers.json
+*.token
+*.key
+.env
+.env.*
+
+# Runtime state
+sessions/
+logs/
+cron.json
+uploads/
+bot.pid
+*_history.json
+
+# Backup files
+*.bak
+*.bak.*
+cc_tg.py.bak*
+mimo_bot.py*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.python-version
+
+# Node (legacy)
+node_modules/
+package*.json
+src/
+public/
+
+# Editor / tooling
+.serena/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

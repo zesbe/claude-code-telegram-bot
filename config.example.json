@@ -1,0 +1,9 @@
+{
+  "telegram_token": "<ISI_TOKEN_BOT_DARI_BOTFATHER>",
+  "owner_ids": [],
+  "default_provider": "claude",
+  "model_slot": "opus",
+  "claude_timeout": 1800,
+  "max_concurrent": 3,
+  "auto_compact_ratio": 0
+}
