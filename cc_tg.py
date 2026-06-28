@@ -16,9 +16,39 @@ import telegramify_markdown
 BOT_DIR = Path(__file__).parent
 CFG = json.loads((BOT_DIR / "config.json").read_text())
 
+# ── Claude Code folder auto-detect ──────────────────────────────────────────
+# `~/.claude` lokasinya bisa di-override (Claude Code menerima env CLAUDE_CONFIG_DIR
+# dari user/install non-standar). Slug folder project di `~/.claude/projects/`
+# saat ini = workdir.replace("/","-"), tapi format bisa berubah saat update — jadi
+# kita scan slug-slug yang ada & cari yang isi-nya cocok dgn workdir kita
+# (fallback berurutan, tahan-update).
+import os as _os
+def _claude_home() -> Path:
+    """Folder Claude Code (default ~/.claude, override via CLAUDE_CONFIG_DIR)."""
+    return Path(_os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+
+def _claude_projects_dir() -> Path:
+    return _claude_home() / "projects"
+
+def _find_claude_bin() -> str:
+    """Cari binary `claude`. Urutan: config → PATH → kandidat umum."""
+    cfg_bin = CFG.get("claude_bin")
+    if cfg_bin and Path(cfg_bin).exists():
+        return cfg_bin
+    import shutil as _sh
+    found = _sh.which("claude")
+    if found:
+        return found
+    for c in (Path.home()/".local/bin/claude", Path("/usr/local/bin/claude"),
+              Path("/usr/bin/claude"), Path.home()/".npm-global/bin/claude",
+              Path.home()/".bun/bin/claude"):
+        if c.exists():
+            return str(c)
+    return cfg_bin or "claude"   # last resort: lewat PATH saat dipanggil
+
 TG_TOKEN    = CFG["telegram_token"]
 OWNER_IDS   = set(CFG.get("owner_ids", []))
-CLAUDE_BIN  = CFG.get("claude_bin", str(Path.home() / ".local/bin/claude"))
+CLAUDE_BIN  = _find_claude_bin()
 WORKDIR     = CFG.get("default_workdir", str(Path.home()))
 CLAUDE_TIMEOUT = CFG.get("claude_timeout", 600)
 MODEL_SLOT  = CFG.get("model_slot", "opus")
@@ -110,7 +140,7 @@ PROVIDERS_FILE = BOT_DIR / "providers.json"
 # nama beda cuma biar gampang dikenali & gak ketuker sama claude-deep dll.
 # Fallback ke claude native kalau wrapper belum dibuat.
 _BOT_WRAPPER   = str(Path.home() / ".local" / "bin" / "claude-telegram")
-NATIVE_CLAUDE  = _BOT_WRAPPER if Path(_BOT_WRAPPER).exists() else str(Path.home() / ".local" / "bin" / "claude")
+NATIVE_CLAUDE  = _BOT_WRAPPER if Path(_BOT_WRAPPER).exists() else CLAUDE_BIN
 HUB_DB = CFG.get("hub_db", str(Path.home() / ".claude-hub" / "profiles.db"))
 DEFAULT_PROVIDER = CFG.get("default_provider", "claude")  # immutable: default utk window BARU (anti cross-chat contamination)
 PROVIDER = DEFAULT_PROVIDER  # global "current": cuma utk display & fallback; disetel ulang tiap user switch
@@ -2099,10 +2129,28 @@ def handle_callback(cb: dict):
 
 # ── Claude Code session discovery ────────────────────────────────────────────
 def _cc_project_dir(workdir: str) -> Path | None:
-    """Find Claude Code project dir for a given working directory."""
-    slug = workdir.replace("/", "-")
-    p = Path.home() / ".claude" / "projects" / slug
-    return p if p.is_dir() else None
+    """Find Claude Code project dir for a given working directory.
+    Auto-detect: cari slug yang exists di ~/.claude/projects/ (atau
+    $CLAUDE_CONFIG_DIR). Coba beberapa format slug supaya tahan update format
+    Claude Code (saat ini = workdir.replace('/','-')."""
+    base = _claude_projects_dir()
+    if not base.is_dir():
+        return None
+    # Format saat ini & varian umum
+    candidates = [
+        workdir.replace("/", "-"),
+        "-" + workdir.lstrip("/").replace("/", "-"),  # leading-dash variant
+        workdir.lstrip("/").replace("/", "-"),        # no leading
+    ]
+    seen = set()
+    for slug in candidates:
+        if slug in seen:
+            continue
+        seen.add(slug)
+        p = base / slug
+        if p.is_dir():
+            return p
+    return None
 
 def _delete_session(workdir: str, session_id: str) -> tuple[bool, int]:
     """Permanently delete all files for a Claude Code session.
@@ -2111,7 +2159,7 @@ def _delete_session(workdir: str, session_id: str) -> tuple[bool, int]:
     if not re.fullmatch(r"[0-9a-fA-F-]{8,}", session_id):
         return False, 0  # guard against path traversal
     proj = _cc_project_dir(workdir)
-    base = Path.home() / ".claude"
+    base = _claude_home()
     targets = []
     if proj:
         targets += [proj / f"{session_id}.jsonl", proj / session_id]
