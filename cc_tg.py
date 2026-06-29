@@ -1559,7 +1559,7 @@ Provider yang kamu tambah di sini bisa langsung dipakai di terminal!
 REPLY_KB = {
     "keyboard": [
         [{"text": "💬 Sesi"}, {"text": "🪟 Project"}],
-        [{"text": "🔌 Provider"}, {"text": "🧠 Model"}],
+        [{"text": "🔌 Provider"}, {"text": "🧠 Model"}, {"text": "🎯 Effort"}],
         [{"text": "📋 Menu"}, {"text": "⏹ Stop"}],
     ],
     "resize_keyboard": True,
@@ -1573,6 +1573,7 @@ QUICK_BTN = {
     "🪟 Project": "/w",
     "🔌 Provider": "/provider",
     "🧠 Model": "_MODELKB_",
+    "🎯 Effort": "_EFFORTKB_",
     "📋 Menu": "/menu",
     "⏹ Stop": "/stop",
 }
@@ -1583,9 +1584,6 @@ QUICK_BTN = {
 MENU_KB = {"inline_keyboard": [
     [{"text": "📊 Disk", "callback_data": "m_disk"},
      {"text": "📊 Status", "callback_data": "m_status"}],
-    [{"text": "🔌 Provider", "callback_data": "m_provider"},
-     {"text": "🧠 Model", "callback_data": "m_model"},
-     {"text": "🎯 Effort", "callback_data": "m_effort"}],
     [{"text": "🆕 Sesi Baru", "callback_data": "m_reset"},
      {"text": "⬇️ Update", "callback_data": "m_update"}],
     [{"text": "🚪 Exit", "callback_data": "m_exit"},
@@ -3682,6 +3680,12 @@ def process(upd: dict):
     if text == "_MODELKB_":
         tg_api("sendMessage", chat_id=cid, text=_to_md(f"🧠 *Pilih model* (aktif: `{_win_model(cid)}`)"),
                parse_mode="MarkdownV2", reply_markup=MODEL_KB)
+        return
+    if text == "_EFFORTKB_":
+        cur = load_sess(cid).get("effort") or "default"
+        tg_api("sendMessage", chat_id=cid,
+               text=_to_md(f"🎯 *Effort level* (aktif: `{cur}`)\nMakin tinggi = mikir lebih dalam, lebih lama/mahal."),
+               parse_mode="MarkdownV2", reply_markup=EFFORT_KB)
         return
 
     # Handle commands
