@@ -1581,16 +1581,15 @@ QUICK_BTN = {
 # Fokus: aksi cepat coding + pengaturan. Navigasi sesi/project/provider ada di
 # reply keyboard (bar bawah).
 MENU_KB = {"inline_keyboard": [
-    [{"text": "📁 Files", "callback_data": "m_browse"},
-     {"text": "📊 Disk", "callback_data": "m_disk"}],
+    [{"text": "📊 Disk", "callback_data": "m_disk"},
+     {"text": "📊 Status", "callback_data": "m_status"}],
     [{"text": "🔌 Provider", "callback_data": "m_provider"},
      {"text": "🧠 Model", "callback_data": "m_model"},
-     {"text": "🎚️ Effort", "callback_data": "m_effort"}],
-    [{"text": "📊 Status", "callback_data": "m_status"},
-     {"text": "🆕 Sesi Baru", "callback_data": "m_reset"}],
-    [{"text": "⬇️ Update", "callback_data": "m_update"},
-     {"text": "❓ Bantuan", "callback_data": "m_help"}],
+     {"text": "🎯 Effort", "callback_data": "m_effort"}],
+    [{"text": "🆕 Sesi Baru", "callback_data": "m_reset"},
+     {"text": "⬇️ Update", "callback_data": "m_update"}],
     [{"text": "🚪 Exit", "callback_data": "m_exit"},
+     {"text": "❓ Bantuan", "callback_data": "m_help"},
      {"text": "✖️ Tutup", "callback_data": "m_close"}],
 ]}
 
@@ -1697,7 +1696,6 @@ def _pv_ask(cid: int, mid: int = None):
 MENU_PROMPTS = {
     # Tombol cepat → jalankan command shell LANGSUNG di bot (tanpa Claude).
     # Lebih cepat + anti-error "Invalid tool use format" dari provider Bedrock.
-    "m_browse":  ("📁 Files", "ls -lah --color=never | head -60"),
     "m_disk":    ("📊 Disk",  "df -h . ; echo ; echo '— 10 folder terbesar —' ; du -sh ./* 2>/dev/null | sort -rh | head -10"),
 }
 
@@ -2015,7 +2013,7 @@ def handle_callback(cb: dict):
         edit_md(cid, mid, "⚙️ Pilih model:", reply_markup=MODEL_KB)
     elif data == "m_effort":
         cur = load_sess(cid).get("effort") or "default"
-        edit_md(cid, mid, f"🎚️ Effort level (aktif: `{cur}`)\nMakin tinggi = mikir lebih dalam, lebih lama/mahal.",
+        edit_md(cid, mid, f"🎯 Effort level (aktif: `{cur}`)\nMakin tinggi = mikir lebih dalam, lebih lama/mahal.",
                 reply_markup=EFFORT_KB)
     elif data in ("set_opus", "set_sonnet", "set_haiku"):
         slot = data.replace("set_", "")
@@ -2031,11 +2029,11 @@ def handle_callback(cb: dict):
         if lvl == "default":
             sess.pop("effort", None)
             save_sess(cid)
-            edit_md(cid, mid, f"🎚️ Effort window **{win}** → *default* (Claude Code yang atur).\n\nKirim pesan untuk lanjut.")
+            edit_md(cid, mid, f"🎯 Effort window **{win}** → *default* (Claude Code yang atur).\n\nKirim pesan untuk lanjut.")
         elif lvl in EFFORT_LEVELS:
             sess["effort"] = lvl
             save_sess(cid)
-            edit_md(cid, mid, f"🎚️ Effort window **{win}** → `{lvl}`\n\n(makin tinggi = mikir lebih dalam, lebih lama/mahal)\nKirim pesan untuk lanjut.")
+            edit_md(cid, mid, f"🎯 Effort window **{win}** → `{lvl}`\n\n(makin tinggi = mikir lebih dalam, lebih lama/mahal)\nKirim pesan untuk lanjut.")
     elif data == "m_provider":
         sess = load_sess(cid)
         edit_md(cid, mid, f"🔌 Pilih provider (window ini: `{sess.get('provider', DEFAULT_PROVIDER)}`):",
@@ -3041,11 +3039,11 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
         if lvl in ("default", "auto", "reset", "off"):
             sess.pop("effort", None)
             save_sess(cid)
-            return "🎚️ Effort → *default* (Claude Code yang atur)."
+            return "🎯 Effort → *default* (Claude Code yang atur)."
         if lvl in EFFORT_LEVELS:
             sess["effort"] = lvl
             save_sess(cid)
-            return f"🎚️ Effort window **{_load_store(cid).get('active','main')}** → `{lvl}`\n\n(makin tinggi = makin dalam mikir, makin lama/mahal)"
+            return f"🎯 Effort window **{_load_store(cid).get('active','main')}** → `{lvl}`\n\n(makin tinggi = makin dalam mikir, makin lama/mahal)"
         return f"❌ Tidak dikenal: `{lvl}`\nPilihan: {', '.join(EFFORT_LEVELS)}, default"
     # ── Hermes-style commands ────────────────────────────────────────────────
     if c in ("/new",):
@@ -3712,7 +3710,7 @@ def process(upd: dict):
         if r == "_EFFORTKB_":
             cur = load_sess(cid).get("effort") or "default"
             tg_api("sendMessage", chat_id=cid,
-                   text=_to_md(f"🎚️ *Effort level* (aktif: `{cur}`)\nMakin tinggi = mikir lebih dalam, lebih lama/mahal."),
+                   text=_to_md(f"🎯 *Effort level* (aktif: `{cur}`)\nMakin tinggi = mikir lebih dalam, lebih lama/mahal."),
                    parse_mode="MarkdownV2", reply_markup=EFFORT_KB)
             return
         if r:
@@ -4009,7 +4007,7 @@ def main():
             {"command": "agents", "description": "🤖 Status task/window berjalan"},
             {"command": "provider", "description": "🔌 Switch provider"},
             {"command": "model", "description": "⚙️ Switch model slot"},
-            {"command": "effort", "description": "🎚️ Atur kedalaman mikir (low→max)"},
+            {"command": "effort", "description": "🎯 Atur kedalaman mikir (low→max)"},
             {"command": "verbose", "description": "📢 Tampilkan semua step live"},
             {"command": "usage", "description": "💰 Pemakaian token/biaya"},
             {"command": "cron", "description": "⏰ Jadwal tugas otomatis"},
