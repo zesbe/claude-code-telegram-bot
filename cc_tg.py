@@ -1582,19 +1582,16 @@ QUICK_BTN = {
 # reply keyboard (bar bawah).
 MENU_KB = {"inline_keyboard": [
     [{"text": "📁 Files", "callback_data": "m_browse"},
-     {"text": "💾 Git", "callback_data": "m_git"},
-     {"text": "🔍 TODO", "callback_data": "m_search"}],
-    [{"text": "📊 Disk", "callback_data": "m_disk"},
-     {"text": "📝 Recent", "callback_data": "m_recent"},
-     {"text": "🧹 Large", "callback_data": "m_large"}],
-    [{"text": "🧠 Model", "callback_data": "m_model"},
-     {"text": "🔌 Provider", "callback_data": "m_provider"},
+     {"text": "📊 Disk", "callback_data": "m_disk"}],
+    [{"text": "🔌 Provider", "callback_data": "m_provider"},
+     {"text": "🧠 Model", "callback_data": "m_model"},
      {"text": "🎚️ Effort", "callback_data": "m_effort"}],
     [{"text": "📊 Status", "callback_data": "m_status"},
      {"text": "🆕 Sesi Baru", "callback_data": "m_reset"}],
-    [{"text": "🚪 Exit", "callback_data": "m_exit"},
+    [{"text": "⬇️ Update", "callback_data": "m_update"},
      {"text": "❓ Bantuan", "callback_data": "m_help"}],
-    [{"text": "✖️ Tutup", "callback_data": "m_close"}],
+    [{"text": "🚪 Exit", "callback_data": "m_exit"},
+     {"text": "✖️ Tutup", "callback_data": "m_close"}],
 ]}
 
 MODEL_KB = {"inline_keyboard": [
@@ -1698,12 +1695,10 @@ def _pv_ask(cid: int, mid: int = None):
                parse_mode="MarkdownV2", reply_markup=cancel_kb)
 
 MENU_PROMPTS = {
-    "m_browse":  ("📁 Browsing…", "List all files and dirs in current directory with sizes, sorted by name"),
-    "m_git":     ("💾 Checking git…", "Run git status, git log --oneline -10, show current branch and remote"),
-    "m_search":  ("🔍 Searching…", "Search codebase for TODO, FIXME, HACK comments and show results"),
-    "m_disk":    ("📊 Checking disk…", "Show disk usage (df -h) and top 10 largest dirs in current path"),
-    "m_recent":  ("📝 Recent files…", "Find files modified in last 24 hours, sorted by time"),
-    "m_large":   ("🧹 Finding large…", "Find files larger than 10MB in home directory, sorted by size"),
+    # Tombol cepat → jalankan command shell LANGSUNG di bot (tanpa Claude).
+    # Lebih cepat + anti-error "Invalid tool use format" dari provider Bedrock.
+    "m_browse":  ("📁 Files", "ls -lah --color=never | head -60"),
+    "m_disk":    ("📊 Disk",  "df -h . ; echo ; echo '— 10 folder terbesar —' ; du -sh ./* 2>/dev/null | sort -rh | head -10"),
 }
 
 def handle_callback(cb: dict):
@@ -1985,17 +1980,25 @@ def handle_callback(cb: dict):
 
     # Actions that go through Claude Code
     if data in MENU_PROMPTS:
-        status_text, prompt = MENU_PROMPTS[data]
+        label, shell_cmd = MENU_PROMPTS[data]
         sess = load_sess(cid)
-        edit_md(cid, mid, status_text)
-        result, _ = run_claude(prompt, cid, sess["workdir"], sess["session_id"],
-                               provider=sess.get("provider"), model=sess.get("model"))
+        wd = sess["workdir"]
+        try:
+            r = subprocess.run(["bash", "-lc", shell_cmd], cwd=wd,
+                               capture_output=True, text=True, timeout=20)
+            out = _strip_ansi((r.stdout or "") + (r.stderr or "")).rstrip()
+        except Exception as e:
+            out = f"(gagal: {str(e)[:120]})"
+        if not out:
+            out = "(kosong)"
+        if len(out) > 3500:
+            out = out[:3500] + "\n…(dipotong)"
+        body = f"{label} · `{wd}`\n\n```\n{out}\n```"
         try:
             tg_api("deleteMessage", chat_id=cid, message_id=mid)
         except Exception:
             pass
-        send_msg(cid, result)
-        save_sess(cid)
+        send_msg(cid, body)
         return
 
     # Local actions
@@ -2200,6 +2203,34 @@ def handle_callback(cb: dict):
         edit_md(cid, mid, "🚪 Keluar dari sesi.\nKetik pesan atau /start untuk mulai lagi.")
     elif data == "m_help":
         send_msg(cid, HELP)
+    elif data == "m_update":
+        # Tombol Update → jalankan update.sh (pull GitHub + restart), async.
+        def _do_update_btn():
+            try:
+                up = BOT_DIR / "update.sh"
+                if not up.exists():
+                    send_msg(cid, "❌ update.sh tidak ada. Manual: `cd ~/.cc-tg && git pull`")
+                    return
+                r = subprocess.run(["bash", str(up)], cwd=str(BOT_DIR),
+                                   capture_output=True, text=True, timeout=180)
+                out = _strip_ansi((r.stdout or "") + (r.stderr or "")).strip()
+                tail = "\n".join(out.splitlines()[-8:])[:1200]
+                if "Sudah versi terbaru" in out:
+                    send_msg(cid, f"✅ *Sudah versi terbaru.*\n\n```\n{tail}\n```")
+                    return
+                send_msg(cid, f"🔄 *Update selesai* — bot restart pakai versi baru.\n\n```\n{tail}\n```")
+                time.sleep(1); os._exit(0)
+            except subprocess.TimeoutExpired:
+                send_msg(cid, "⏰ Update timeout (>3 menit).")
+            except Exception as e:
+                send_msg(cid, f"❌ Update gagal: {str(e)[:200]}")
+        try:
+            tg_api("deleteMessage", chat_id=cid, message_id=mid)
+        except Exception:
+            pass
+        send_msg(cid, "⬇️ Mengambil update dari GitHub… (tunggu ~10-30 detik)")
+        log("Update requested via MENU button")
+        threading.Thread(target=_do_update_btn, daemon=True).start()
     elif data == "m_back":
         edit_md(cid, mid, "⚡ **Aksi cepat** — pilih di bawah:", reply_markup=MENU_KB)
     elif data in ("m_close", "close"):
