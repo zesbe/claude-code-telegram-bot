@@ -1584,6 +1584,9 @@ QUICK_BTN = {
 MENU_KB = {"inline_keyboard": [
     [{"text": "📊 Disk", "callback_data": "m_disk"},
      {"text": "📊 Status", "callback_data": "m_status"}],
+    [{"text": "💰 Usage", "callback_data": "m_usage"},
+     {"text": "🤖 Agents", "callback_data": "m_agents"},
+     {"text": "⏰ Cron", "callback_data": "m_cron"}],
     [{"text": "🆕 Sesi Baru", "callback_data": "m_reset"},
      {"text": "⬇️ Update", "callback_data": "m_update"}],
     [{"text": "🚪 Exit", "callback_data": "m_exit"},
@@ -2007,6 +2010,12 @@ def handle_callback(cb: dict):
             f"Folder: `{sess['workdir']}`\n"
             f"Sesi: `{sess['session_id'][:8]}`"
         ))
+    elif data == "m_usage":
+        send_msg(cid, cmd(cid, "/usage", None) or "💰 Belum ada pemakaian.")
+    elif data == "m_agents":
+        send_msg(cid, cmd(cid, "/agents", None) or "🤖 Tidak ada task berjalan.")
+    elif data == "m_cron":
+        send_msg(cid, cmd(cid, "/cron", None) or "⏰ Belum ada jadwal.")
     elif data == "m_model":
         edit_md(cid, mid, "⚙️ Pilih model:", reply_markup=MODEL_KB)
     elif data == "m_effort":
@@ -3928,7 +3937,7 @@ def _cron_command(cid: int, a: str) -> str:
                      "workdir": sess["workdir"], "provider": sess.get("provider", PROVIDER),
                      "model": sess.get("model", MODEL_SLOT), "last_run": ""})
         _save_cron(jobs)
-        return f"⏰ Jadwal ditambah: tiap hari **{hh:02d}:{mm:02d}**\n`{prompt[:60]}`"
+        return f"⏰ Jadwal ditambah: tiap hari **{hh:02d}:{mm:02d} WIB**\n`{prompt[:60]}`"
     if sub in ("del", "delete", "rm") and len(parts) > 1:
         try:
             idx = int(parts[1]) - 1
@@ -3943,12 +3952,13 @@ def _cron_command(cid: int, a: str) -> str:
     # list
     mine = [j for j in jobs if j["cid"] == cid]
     if not mine:
-        return ("⏰ **Cron / Jadwal**\n\nBelum ada jadwal.\n\n"
+        return ("⏰ **Cron / Jadwal** (waktu WIB)\n\nBelum ada jadwal.\n\n"
                 "Tambah: `/cron add 07:00 cek server lapor ke aku`\n"
-                "Hapus: `/cron del 1`")
-    lines = ["⏰ **Jadwal Aktif**\n"]
+                "Hapus: `/cron del 1`\n\n"
+                "_Jam pakai WIB (Asia/Jakarta). Jalan tiap hari di jam itu._")
+    lines = ["⏰ **Jadwal Aktif** (WIB)\n"]
     for i, j in enumerate(mine, 1):
-        lines.append(f"{i}. **{j['time']}** — `{j['prompt'][:50]}`")
+        lines.append(f"{i}. **{j['time']} WIB** — `{j['prompt'][:50]}`")
     lines.append("\nTambah: `/cron add HH:MM <prompt>` · Hapus: `/cron del <n>`")
     return "\n".join(lines)
 
