@@ -1153,6 +1153,73 @@ def _session_exists(workdir: str, session_id: str) -> bool:
         return False
     return (proj / f"{session_id}.jsonl").exists()
 
+def _repair_session(workdir: str, session_id: str) -> int:
+    """Buang orphan tool_result dari .jsonl sesi (yang tool_use_id-nya tak punya
+    pasangan tool_use). Mismatch ini terjadi kalau proses claude ke-kill di tengah
+    tool call (via /stop, timeout, crash) → resume di provider Bedrock-based
+    (mis. omni) gagal '400 toolResult exceeds toolUse'. Anthropic native memaafkan,
+    Bedrock strict. Repair ini bikin sesi valid di SEMUA provider tanpa kehilangan
+    konteks. Idempotent + aman (sesi sehat tak disentuh). Returns jumlah baris dibuang."""
+    proj = _cc_project_dir(workdir)
+    if not proj:
+        return 0
+    jl = proj / f"{session_id}.jsonl"
+    if not jl.exists():
+        return 0
+    try:
+        lines = jl.read_text().splitlines()
+    except Exception:
+        return 0
+    # 1) kumpulkan semua id tool_use yang ada
+    use_ids = set()
+    for ln in lines:
+        try:
+            o = json.loads(ln)
+        except Exception:
+            continue
+        c = (o.get("message") or {}).get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict) and b.get("type") == "tool_use":
+                    use_ids.add(b.get("id"))
+    # 2) buang block tool_result yang tool_use_id-nya tak ada di use_ids;
+    #    kalau pesan jadi kosong (cuma berisi orphan), buang seluruh barisnya.
+    out, removed = [], 0
+    for ln in lines:
+        try:
+            o = json.loads(ln)
+        except Exception:
+            out.append(ln)
+            continue
+        msg = o.get("message")
+        c = (msg or {}).get("content")
+        if not isinstance(c, list):
+            out.append(ln)
+            continue
+        kept = [b for b in c
+                if not (isinstance(b, dict) and b.get("type") == "tool_result"
+                        and b.get("tool_use_id") not in use_ids)]
+        if len(kept) == len(c):
+            out.append(ln)                 # tak ada orphan di baris ini
+            continue
+        if not kept:
+            removed += 1                   # seluruh baris isinya orphan → drop
+            continue
+        msg["content"] = kept              # sebagian orphan → sisakan yang valid
+        removed += 1
+        out.append(json.dumps(o, ensure_ascii=False))
+    if removed:
+        bak = jl.with_suffix(".jsonl.prerepair.bak")
+        try:
+            if not bak.exists():
+                bak.write_text("\n".join(lines) + "\n")
+            jl.write_text("\n".join(out) + "\n")
+            log(f"repair_session {session_id[:8]}: buang {removed} orphan tool_result")
+        except Exception as e:
+            log(f"repair_session {session_id[:8]} gagal tulis: {e}")
+            return 0
+    return removed
+
 def _set_session_id(chat_id: int, session_id: str):
     """Persist a session_id into the active window."""
     if chat_id in _store:
@@ -1212,6 +1279,13 @@ def run_claude(prompt: str, chat_id: int, workdir: str, session_id: str,
         return base
 
     resume = _session_exists(workdir, session_id)
+    if resume:
+        # Auto-repair: buang orphan tool_result sebelum resume, supaya sesi yg
+        # sempat korup (proses ke-kill mid-tool) tetap valid di provider Bedrock.
+        try:
+            _repair_session(workdir, session_id)
+        except Exception:
+            pass
 
     for attempt in range(2):
         result_text, usage, err_text = "", {}, ""
@@ -1393,6 +1467,7 @@ Pakai **tombol di bawah** 👇 untuk navigasi cepat:
 🆕 **Sesi Baru** — mulai dari awal
 
 *Atau langsung ketik pesan untuk mulai coding.*
+🖥 Provider di sini juga bisa dipakai di terminal: ketik `claude-terminal`.
 Ketik /help untuk daftar command lengkap."""
 
 HELP = """📖 **Panduan Lengkap CC-TG**
@@ -1467,6 +1542,12 @@ Di grup pakai Topics: tiap topic = project terpisah
 • `/menu` — tombol aksi cepat (files/git/dll)
 • `/status` — info sesi/provider/model sekarang
 • `/start` — panduan singkat + tombol
+
+**🖥 Pakai di Terminal juga**
+Provider yang kamu tambah di sini bisa langsung dipakai di terminal!
+• Jalankan: `claude-terminal` → muncul menu pilih provider
+• `claude-terminal <nama>` — langsung (mis. `claude-terminal omni`)
+• Sumbernya sama (`~/.cc-tg/providers.json`) — tambah di bot, otomatis muncul di terminal.
 
 💡 *Tombol di bar bawah = akses cepat tanpa ngetik.*
 💡 *Ketik pesan biasa = langsung ke Claude Code.*"""
