@@ -360,6 +360,19 @@ else
     ok "Tanpa systemd. Jalankan manual: $INSTALL_DIR/start.sh"
 fi
 
+# ── pasang wrapper claude-terminal (menu provider di terminal) ────────────────
+if [ -f "$INSTALL_DIR/claude-terminal.sh" ]; then
+    BINDIR="$HOME/.local/bin"
+    mkdir -p "$BINDIR"
+    install -m 755 "$INSTALL_DIR/claude-terminal.sh" "$BINDIR/claude-terminal" 2>/dev/null \
+        && ok "Wrapper terminal terpasang: ${C_BLD}claude-terminal${C_RST} (menu provider dari bot)" \
+        || warn "Gagal pasang claude-terminal (cek izin $BINDIR)"
+    case ":$PATH:" in
+        *":$BINDIR:"*) : ;;
+        *) warn "$BINDIR belum di PATH — tambahkan: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+    esac
+fi
+
 # ── selesai ───────────────────────────────────────────────────────────────────
 hr
 printf '%s\n' "${C_GRN}${C_BLD}  ✓ Instalasi selesai!${C_RST}" >&2

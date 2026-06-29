@@ -1529,6 +1529,7 @@ Di grup pakai Topics: tiap topic = project terpisah
 • `/whoami` — cek level akses kamu
 • `/version` (`/v`) — versi Claude Code
 • `/yolo` — status mode YOLO
+• `/update` — update bot ke versi terbaru dari GitHub + restart
 • `/restart` — restart bot (auto-up via systemd)
 
 	**🧠 Reasoning & konteks**
@@ -3079,6 +3080,35 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
         log("Restart requested via /restart")
         threading.Thread(target=lambda: (time.sleep(1), os._exit(0)), daemon=True).start()
         return None
+    if c == "/update":
+        # Pull versi terbaru dari GitHub lalu restart. update.sh sudah handle:
+        # reset file kode ke origin/main (config/providers aman, gitignored) +
+        # sinkron deps + restart service. Dijalankan async biar /update langsung balas.
+        def _do_update():
+            try:
+                up = BOT_DIR / "update.sh"
+                if not up.exists():
+                    send_msg(cid, "❌ update.sh tidak ada. Update manual: `cd ~/.cc-tg && git pull`")
+                    return
+                r = subprocess.run(["bash", str(up)], cwd=str(BOT_DIR),
+                                   capture_output=True, text=True, timeout=180)
+                out = _strip_ansi((r.stdout or "") + (r.stderr or "")).strip()
+                tail = "\n".join(out.splitlines()[-8:])[:1200]
+                if "Sudah versi terbaru" in out:
+                    send_msg(cid, f"✅ *Sudah versi terbaru* — tidak ada update.\n\n```\n{tail}\n```")
+                    return
+                send_msg(cid, f"🔄 *Update selesai* — bot akan restart pakai versi baru.\n\n```\n{tail}\n```")
+                # restart kalau update.sh belum (mis. bukan systemd) — exit, systemd auto-up
+                time.sleep(1)
+                os._exit(0)
+            except subprocess.TimeoutExpired:
+                send_msg(cid, "⏰ Update timeout (>3 menit). Coba manual: `cd ~/.cc-tg && ./update.sh`")
+            except Exception as e:
+                send_msg(cid, f"❌ Update gagal: {str(e)[:200]}")
+        send_msg(cid, "⬇️ Mengambil update dari GitHub… (tunggu ~10-30 detik)")
+        log("Update requested via /update")
+        threading.Thread(target=_do_update, daemon=True).start()
+        return None
     if c == "/retry":
         # Kirim ulang pesan terakhir user di window ini
         sess = load_sess(cid)
@@ -3961,6 +3991,7 @@ def main():
             {"command": "cd", "description": "📂 Change workdir"},
             {"command": "pwd", "description": "📂 Show workdir"},
             {"command": "restart", "description": "♻️ Restart bot"},
+            {"command": "update", "description": "⬇️ Update bot dari GitHub + restart"},
             {"command": "compact", "description": "🗜️ Ringkas + fresh context (hemat token)"},
             {"command": "undo", "description": "↩️ Mundurkan N turn terakhir"},
             {"command": "clear", "description": "🧹 Bersihkan layar & sesi baru"},
