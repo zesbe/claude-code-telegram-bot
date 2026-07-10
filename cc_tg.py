@@ -7,8 +7,9 @@ This bot just relays Telegram messages to the native `claude` binary
 
 Usage: python3 cc_tg.py
 """
-import json, os, sys, time, subprocess, re, uuid, sqlite3, traceback, threading, unicodedata
+import json, os, sys, time, subprocess, re, uuid, sqlite3, traceback, threading, unicodedata, queue
 from pathlib import Path
+from datetime import datetime, timedelta
 import httpx
 import telegramify_markdown
 
@@ -105,6 +106,7 @@ _busy: set[int] = set()          # chats currently running Claude Code
 _current_chat_id: int = 0        # set before run_claude, used by send_to_telegram.sh
 _pending_rename: dict[int, str] = {}  # cid -> session_id waiting for a new title
 _pending_provider: dict = {}     # cid -> {"step": str, "data": {...}} add-provider wizard
+_pending_cron: dict = {}         # cid -> {"step": str, "data": {...}} add-cron wizard
 _running_procs: dict = {}        # lock_key -> Popen (for /stop interrupt)
 _cancelled: set = set()          # lock_keys user asked to cancel
 _usage_log: dict = {}            # provider -> {"tokens": int, "cost": float, "calls": int}
@@ -442,18 +444,73 @@ def log(msg: str):
     print(line, flush=True)
 
 # ── Telegram helpers ────────────────────────────────────────────────────────
+# Gerbang antrian GLOBAL per chat. Telegram jatah ~1 msg/detik/chat; tanpa
+# gerbang, thread-thread (flusher edit + kirim chunk + notif) nyerbu barengan →
+# badai 429 yg penaltinya makin panjang (bukti log 2026-07-02 11:42–11:54:
+# sendMessage pun tewas → chunk jawaban HILANG). Gerbang juga MENYEBARKAN
+# retry_after: sekali Telegram bilang "tunggu 35s", SEMUA thread chat itu nahan.
+_tg_gate_lock = threading.Lock()
+_tg_next_ok: dict = {}          # chat_id → epoch akhir PENALTI 429 (retry_after)
+_tg_bucket: dict = {}           # chat_id → (sisa_token, ts_refill_terakhir)
+_TG_RATE = 1.05                 # detik per token (rata aman ~1 pesan/detik/chat)
+_TG_BURST = 3                   # burst: 3 pesan boleh keluar beruntun instan
+
+def _tg_gate_wait(chat_id, abort=None):
+    # Token bucket per chat: rangkaian pendek (narasi + kartu tool + jawaban)
+    # keluar BERUNTUN tanpa jeda — kerasa cepat kayak Hermes — sementara laju
+    # rata tetap 1/detik jadi anti-429 tetap utuh. Penalti retry_after dari
+    # Telegram tetap dihormati penuh & berlaku utk semua thread chat ini.
+    if not chat_id:
+        return True              # getUpdates dkk (tanpa chat_id) bebas
+    while True:
+        if abort and abort():
+            return False         # caller batal (mis. stream sudah difinalize)
+        with _tg_gate_lock:
+            now = time.time()
+            tokens, last = _tg_bucket.get(chat_id, (float(_TG_BURST), now))
+            tokens = min(float(_TG_BURST), tokens + (now - last) / _TG_RATE)
+            nxt = _tg_next_ok.get(chat_id, 0.0)
+            if now >= nxt and tokens >= 1.0:
+                _tg_bucket[chat_id] = (tokens - 1.0, now)
+                return True
+            _tg_bucket[chat_id] = (tokens, now)
+            wait = max(nxt - now, (1.0 - tokens) * _TG_RATE)
+        time.sleep(min(max(wait, 0.05), 5.0))
+
+def _tg_gate_penalize(chat_id, seconds: float):
+    if not chat_id:
+        return
+    with _tg_gate_lock:
+        _tg_next_ok[chat_id] = max(_tg_next_ok.get(chat_id, 0.0),
+                                   time.time() + seconds)
+
 def tg_api(method: str, **kw) -> dict:
-    # All topics in one group share a chat_id; live-streaming many topics at
-    # once can hit Telegram's ~1 msg/sec/chat limit → HTTP 429. Honor the
-    # server's retry_after and back off instead of crashing the call.
-    for attempt in range(4):
+    # sendMessage = jalur JAWABAN → paling gigih (pesan hilang itu fatal);
+    # edit dkk boleh nyerah lebih cepat (flush berikutnya menimpa).
+    # retry_after DIHORMATI penuh — dulu dipangkas max 10s, jadi nge-poke pas
+    # penalti belum kelar → Telegram perpanjang penalti → 429 gak kelar-kelar.
+    # `_abort` (callable→bool, opsional): caller bisa membatalkan call yg masih
+    # ngantri/retry — dipakai flusher supaya edit BASI (teks streaming lama) yg
+    # ketahan penalti 429 tidak menimpa kartu status setelah finalize.
+    abort = kw.pop("_abort", None)
+    chat_id = kw.get("chat_id")
+    persistent = method == "sendMessage"
+    attempts = 8 if persistent else 4
+    max_wait = 120.0 if persistent else 45.0
+    for attempt in range(attempts):
+        if not _tg_gate_wait(chat_id, abort):
+            return {}
+        if abort and abort():
+            return {}
         r = tg_http.post(f"{TG}/{method}", json=kw)
         if r.status_code == 429:
             try:
-                wait = r.json().get("parameters", {}).get("retry_after", 1)
+                wait = float(r.json().get("parameters", {}).get("retry_after", 1))
             except Exception:
-                wait = 1
-            time.sleep(min(wait, 10) + 0.1)
+                wait = 1.0
+            wait = min(wait, max_wait) + 0.1
+            _tg_gate_penalize(chat_id, wait)   # semua thread chat ini ikut nunggu
+            time.sleep(wait)
             continue
         r.raise_for_status()
         d = r.json()
@@ -484,6 +541,124 @@ def _download_tg_file(cid: int, file_id: str, file_name: str) -> str:
         log(f"download failed: {e}")
         return ""
 
+# ── Lampiran foto/file: niru drag-drop terminal (path absolut quoted) ──────────
+# Claude Code di terminal pas di-drag file dapet path absolut & baca via Read.
+# Kita tiru persis: kasih instruksi + daftar path quoted. Bukan base64 (hindari
+# token-bloat + risiko di-mangle proxy provider).
+TG_FILE_LIMIT = 20 * 1024 * 1024   # Bot API getFile mentok 20MB
+
+def _attach_prompt(caption: str, paths: list) -> str:
+    quoted = " ".join(f"'{p}'" for p in paths)
+    instr = (caption or "").strip() or "Tolong lihat/analisa file berikut."
+    # Baris path dipisah biar tegas — mitigasi Claude skip Read.
+    return f"{instr}\n\nBaca file berikut: {quoted}"
+
+def _ensure_uploads_gitignore(workdir: str):
+    """Kalau workdir repo git, pastikan uploads/ di-ignore biar gambar tak
+    ke-push ke GitHub. Idempotent; bikin .gitignore kalau belum ada."""
+    try:
+        wd = Path(workdir)
+        if not (wd / ".git").exists():
+            return
+        gi = wd / ".gitignore"
+        lines = gi.read_text().splitlines() if gi.exists() else []
+        if any(l.strip().rstrip("/") == "uploads" for l in lines):
+            return
+        with gi.open("a") as f:
+            if lines and lines[-1].strip():
+                f.write("\n")
+            f.write("# CC-TG: lampiran dari Telegram\nuploads/\n")
+        log(f"gitignore: + uploads/ → {gi}")
+    except Exception as e:
+        log(f"gitignore skip: {e}")
+
+# Album buffer: Telegram kirim tiap foto album sebagai update terpisah (ikat
+# media_group_id sama). Kita kumpulin + debounce, lalu proses SEKALI.
+_album_buf: dict = {}
+_album_lock = threading.Lock()
+# Telegram kirim tiap foto album sbg update TERPISAH (media_group_id sama),
+# datang berdekatan (~<2s). TAPI download tiap file makan waktu beda2 (file
+# besar / koneksi lambat bisa 9s+, terbukti di log). BUG lama: _album_add baru
+# dipanggil SETELAH download → debounce 1.5s keburu habis sebelum file kedua
+# selesai → album pecah jadi banyak run "1 file".
+# FIX: daftar item SAAT update masuk (SEBELUM download) via _album_note →
+# tahu berapa "expected". Flush cuma ketika collect-window habis DAN semua
+# download beres (received>=expected), atau hard-timeout (safety).
+_ALBUM_COLLECT = 2.5    # detik tanpa update album baru = update album lengkap
+_ALBUM_HARD_MAX = 120   # batas keras nunggu semua download (anti-hang)
+
+def _album_note(key, ctx: dict):
+    """Register 1 item album SEBELUM download — cuma naikin 'expected' & reset
+    collect-timer. Dipanggil segera saat update foto/doc album masuk."""
+    with _album_lock:
+        b = _album_buf.get(key)
+        if not b:
+            b = {"paths": [], "caption": "", "expected": 0, "received": 0,
+                 "collect_done": False, "collect_timer": None, "hard_timer": None,
+                 **ctx}
+            _album_buf[key] = b
+            ht = threading.Timer(_ALBUM_HARD_MAX, _album_flush, args=(key, True))
+            ht.daemon = True
+            b["hard_timer"] = ht
+            ht.start()
+        b["expected"] += 1
+        if b["collect_timer"]:
+            b["collect_timer"].cancel()
+        ct = threading.Timer(_ALBUM_COLLECT, _album_collect_done, args=(key,))
+        ct.daemon = True
+        b["collect_timer"] = ct
+        ct.start()
+
+def _album_deposit(key, path: str, caption: str):
+    """Setoran hasil download 1 item album (path kosong = download gagal, tetap
+    dihitung biar flush gak nunggu selamanya). Flush kalau semua sudah beres."""
+    ready = False
+    with _album_lock:
+        b = _album_buf.get(key)
+        if not b:
+            return
+        b["received"] += 1
+        if path:
+            b["paths"].append(path)
+        if caption and not b["caption"]:
+            b["caption"] = caption   # caption album biasanya nempel di 1 foto
+        if b["collect_done"] and b["received"] >= b["expected"]:
+            ready = True
+    if ready:
+        _album_flush(key)
+
+def _album_collect_done(key):
+    """Collect-window habis: update album dianggap lengkap. Flush kalau semua
+    download sudah beres; kalau belum, biar _album_deposit terakhir yg flush."""
+    ready = False
+    with _album_lock:
+        b = _album_buf.get(key)
+        if not b:
+            return
+        b["collect_done"] = True
+        if b["received"] >= b["expected"] and b["expected"] > 0:
+            ready = True
+    if ready:
+        _album_flush(key)
+
+def _album_flush(key, hard=False):
+    with _album_lock:
+        b = _album_buf.pop(key, None)
+        if b:
+            for tk in ("collect_timer", "hard_timer"):
+                if b.get(tk):
+                    b[tk].cancel()
+    if not b or not b["paths"]:
+        return
+    text = _attach_prompt(b["caption"], b["paths"])
+    m = {"chat": {"id": b["cid"], "type": b["chat_type"]},
+         "from": {"id": b["uid"]}, "message_id": b["mid"], "text": text}
+    if b.get("thread_id"):
+        m["message_thread_id"] = b["thread_id"]
+    log(f"album flush{' (hard-timeout)' if hard else ''}: {len(b['paths'])}/"
+        f"{b['expected']} file → run")
+    _process_safe({"message": m})   # re-masuk pipeline normal (1 run, semua path)
+
 def _strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from Claude Code output."""
     return re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
@@ -491,7 +666,13 @@ def _strip_ansi(text: str) -> str:
 # ── Markdown tables → boxed monospace grids (Telegram MarkdownV2 has no tables) ─
 _MD_TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
 _MD_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)+\|?\s*$")
-_MAX_BOX_WIDTH = 64  # display cols; wider tables wrap ugly in Telegram → skip boxing
+_MAX_BOX_WIDTH = 120  # display cols; user pilih tabel lebar drpd dipotong ("gpp makan tempat")
+_MIN_COL_W = 6        # lantai lebar kolom saat menyusutkan tabel super lebar
+# Karakter box-drawing → deteksi tabel yg digambar model langsung (bukan pipe table)
+_BOX_CHARS = set("┌┬┐├┼┤└┴┘─│╔╦╗╠╬╣╚╩╝═║╭╮╰╯┏┳┓┣╋┫┗┻┛━┃")
+
+def _is_boxline(ln: str) -> bool:
+    return sum(1 for c in ln if c in _BOX_CHARS) >= 2
 
 def _dispw(s: str) -> int:
     """Display width: CJK/fullwidth chars count as 2 (best-effort, no emoji)."""
@@ -509,48 +690,71 @@ def _box_split_row(line: str) -> list:
         s = s[:-1]
     return [c.strip() for c in s.split("|")]
 
+def _wrap_cell(s: str, width: int) -> list:
+    """Word-wrap isi sel ke `width` kolom display; token raksasa (URL/path
+    tanpa spasi) dipotong keras. Konten TIDAK pernah dibuang, cuma turun baris."""
+    out, cur = [], ""
+    for tok in s.split():
+        while _dispw(tok) > width:
+            if cur:
+                out.append(cur)
+                cur = ""
+            head, w = "", 0
+            for ch in tok:
+                cw = _dispw(ch)
+                if w + cw > width:
+                    break
+                head += ch
+                w += cw
+            out.append(head)
+            tok = tok[len(head):]
+        if not tok:
+            continue
+        cand = (cur + " " + tok) if cur else tok
+        if _dispw(cand) > width and cur:
+            out.append(cur)
+            cur = tok
+        else:
+            cur = cand
+    if cur or not out:
+        out.append(cur)
+    return out
+
 def _render_box(rows: list) -> str:
     ncols = max((len(r) for r in rows), default=0)
     if ncols == 0:
         return ""
     rows = [r + [""] * (ncols - len(r)) for r in rows]
     widths = [max(_dispw(r[c]) for r in rows) for c in range(ncols)]
-    if sum(widths) + 3 * ncols + 1 > _MAX_BOX_WIDTH:
-        return ""  # too wide → caller leaves markdown as-is
+    # Kelebaran? Susutkan kolom terlebar selangkah demi selangkah — isi sel
+    # di-WRAP ke beberapa baris, bukan dibuang (tabel wajib tampil utuh).
+    while (sum(widths) + 3 * ncols + 1) > _MAX_BOX_WIDTH and max(widths) > _MIN_COL_W:
+        widths[widths.index(max(widths))] -= 1
     def bar(l, m, r):
         return l + m.join("─" * (w + 2) for w in widths) + r
     out = [bar("┌", "┬", "┐")]
     for ri, r in enumerate(rows):
-        out.append("│" + "│".join(" " + _box_pad(r[c], widths[c]) + " " for c in range(ncols)) + "│")
+        cells = [_wrap_cell(r[c], widths[c]) for c in range(ncols)]
+        tall = max(len(cl) for cl in cells)
+        for cl in cells:
+            cl.extend([""] * (tall - len(cl)))
+        for k in range(tall):
+            out.append("│" + "│".join(
+                " " + _box_pad(cells[c][k], widths[c]) + " " for c in range(ncols)) + "│")
         if ri == 0:
             out.append(bar("├", "┼", "┤"))
     out.append(bar("└", "┴", "┘"))
     return "\n".join(out)
 
-def _render_table_bullets(rows: list) -> str:
-    """Wide-table fallback (saat box grid bakal wrap jelek): tiap baris jadi
-    'kartu' vertikal — label baris bold + bullet 'kolom: nilai'. Markdown biasa
-    (bukan monospace); meniru gaya tabel Hermes di Telegram."""
-    if len(rows) < 2:
-        return ""
-    headers = rows[0]
-    cards = []
-    for r in rows[1:]:
-        if not any((c or "").strip() for c in r):
-            continue
-        heading = r[0].strip() if r and r[0].strip() else "•"
-        bullets = []
-        for idx, val in enumerate(r[1:], start=1):
-            col = headers[idx].strip() if idx < len(headers) and headers[idx].strip() else f"col{idx}"
-            val = (val or "").strip()
-            if val and val != heading:
-                bullets.append(f"• {col}: {val}")
-        cards.append(f"**{heading}**" + ("\n" + "\n".join(bullets) if bullets else ""))
-    return "\n\n".join(cards)
-
 def _boxify_tables(text: str) -> str:
-    """Replace GFM markdown tables with Unicode box-drawing tables inside a
-    fenced code block (monospace in Telegram). Non-table text untouched."""
+    """Rapikan tabel utk Telegram: pipe table (GFM) di-render ulang jadi box
+    grid, tabel box-drawing yg digambar model langsung cukup dibungkus fence —
+    dua-duanya jadi monospace (kolom sejajar + tap-to-copy). Isi ``` fence
+    yg sudah ada TIDAK disentuh (idempotent, gak dobel-bungkus)."""
+    parts = re.split(r"(```.*?```)", text, flags=re.DOTALL)
+    return "".join(p if p.startswith("```") else _boxify_plain(p) for p in parts)
+
+def _boxify_plain(text: str) -> str:
     lines = text.split("\n")
     out, i, n = [], 0, len(lines)
     while i < n:
@@ -563,11 +767,18 @@ def _boxify_tables(text: str) -> str:
                 rows.append(_box_split_row(lines[j]))
                 j += 1
             box = _render_box(rows)
-            if box:
-                out.append("```\n" + box + "\n```")
+            out.append("```\n" + box + "\n```" if box else "\n".join(lines[i:j]))
+            i = j
+        elif _is_boxline(lines[i]):
+            # Tabel box-drawing yg digambar model sendiri: tanpa fence tampil
+            # font proporsional (kolom mencong). Bungkus fence apa adanya.
+            j = i
+            while j < n and _is_boxline(lines[j]):
+                j += 1
+            if j - i >= 3:
+                out.append("```\n" + "\n".join(lines[i:j]) + "\n```")
             else:
-                bullets = _render_table_bullets(rows)  # too wide → vertical cards
-                out.append(bullets if bullets else "\n".join(lines[i:j]))
+                out.extend(lines[i:j])
             i = j
         else:
             out.append(lines[i])
@@ -631,8 +842,10 @@ def _format_mdv2(content: str) -> str:
     return text
 
 def _to_md(text: str) -> str:
-    """Markdown → Telegram MarkdownV2 yang rapi. Tabel jadi box/bullet dulu."""
-    if text and "|" in text:
+    """Markdown → Telegram MarkdownV2 yang rapi. Tabel jadi box monospace dulu.
+    Gate cek juga garis vertikal box-drawing (│║┃) — tabel yg digambar model
+    langsung gak punya '|' ASCII sama sekali."""
+    if text and any(ch in text for ch in ("|", "│", "║", "┃")):
         try:
             text = _boxify_tables(text)
         except Exception:
@@ -653,14 +866,17 @@ def _split_chunks(text: str, limit: int = 4000) -> list:
         if len(candidate) > limit and buf:
             chunks.append(buf)
             buf = para
-            while len(buf) > limit:
-                idx = buf.rfind("\n", 0, limit)
-                if idx < 0:
-                    idx = limit
-                chunks.append(buf[:idx])
-                buf = buf[idx:].lstrip("\n")
         else:
             buf = candidate
+        # Pecah buf yg kepanjangan (termasuk satu paragraf raksasa tanpa \n\n).
+        while len(buf) > limit:
+            idx = buf.rfind("\n", 0, limit)
+            if idx <= 0:
+                idx = buf.rfind(" ", 0, limit)   # gak ada newline → potong di spasi
+            if idx <= 0:
+                idx = limit                      # gak ada spasi → potong keras
+            chunks.append(buf[:idx])
+            buf = buf[idx:].lstrip("\n ")
     if buf.strip():
         chunks.append(buf)
     # Repair ``` fences split across chunks
@@ -671,8 +887,87 @@ def _split_chunks(text: str, limit: int = 4000) -> list:
         fixed.append(c)
     return fixed
 
+def _smart_chunks(text: str, hard_limit: int = 3500,
+                  target: int = 450, min_total: int = 450,
+                  max_paras: int = 1, max_msgs: int = 14) -> list:
+    """Pecah jawaban gaya potongan ✂️/Hermes: default SATU PARAGRAF = SATU
+    PESAN (permintaan user: long-press → Copy dapet persis bagian itu).
+    Aturan:
+      • Blok kode (``` … ```) SELALU jadi pesan sendiri (gampang copy kode).
+      • max_paras=1 → tiap paragraf pesan sendiri; heading (# / **bold**)
+        juga selalu berdiri sendiri. List ber-\\n tunggal tetap satu blok.
+      • Jawaban pendek (≤ min_total) TETAP 1 pesan — biar nggak lebay.
+      • Jawaban super panjang: paragraf digabung adaptif supaya total pesan
+        ≤ ~max_msgs (bucket macu burst 3 lalu ~1 pesan/detik; 30 pesan = 30s
+        nunggu — kebanyakan potongan malah bikin lambat).
+    Tiap potongan tetap aman < hard_limit (limit Telegram)."""
+    body = (text or "").strip()
+    if len(body) <= min_total and "```" not in body:
+        return [body]
+    # Pisah jadi blok: code-fence vs teks biasa (regex tangkap ```...```).
+    parts = re.split(r'(```.*?```)', body, flags=re.DOTALL)
+    chunks, buf, n_para = [], "", 0
+
+    def _flush():
+        nonlocal buf, n_para
+        if buf.strip():
+            chunks.append(buf.strip())
+        buf, n_para = "", 0
+
+    def _is_heading(p: str) -> bool:
+        first = p.split("\n", 1)[0].strip()
+        return bool(re.match(r"^#{1,6}\s", first)
+                    or re.fullmatch(r"\*\*[^*\n]{1,80}\*\*:?", first))
+
+    for part in parts:
+        if not part.strip():
+            continue
+        if part.startswith("```"):
+            _flush()                       # tutup teks sebelumnya
+            chunks.append(part.strip())    # code block = pesan sendiri
+            continue
+        for para in part.split("\n\n"):
+            para = para.strip()
+            if not para:
+                continue
+            if buf and (_is_heading(para) or n_para >= max_paras
+                        or len(buf) + 2 + len(para) > target):
+                _flush()
+            buf = (buf + "\n\n" + para) if buf else para
+            n_para += 1
+    _flush()
+    # Jaga tiap chunk < hard_limit (kalau ada paragraf/code raksasa).
+    safe = []
+    for c in chunks:
+        if len(c) <= hard_limit:
+            safe.append(c)
+        else:
+            safe.extend(_split_chunks(c, hard_limit))
+    safe = [c for c in safe if c.strip()]
+    # Rem jumlah pesan: kebanyakan potongan = lambat (bucket ~1 pesan/detik
+    # setelah burst). Gabung pasangan bertetangga TERKECIL berulang sampai
+    # total ≤ max_msgs — potongan kecil2 nyatu, paragraf gede tetap sendiri.
+    def _is_code(c):
+        return c.startswith("```")
+    while len(safe) > max_msgs:
+        best, bi = None, -1
+        for i in range(len(safe) - 1):
+            if _is_code(safe[i]) or _is_code(safe[i + 1]):
+                continue
+            tot = len(safe[i]) + len(safe[i + 1])
+            if tot <= hard_limit and (best is None or tot < best):
+                best, bi = tot, i
+        if bi < 0:
+            break                      # sisa code block semua / mentok limit
+        safe[bi] = safe[bi] + "\n\n" + safe.pop(bi + 1)
+    return safe
+
 def _send_raw(chat_id: int, md: str, reply_to: int = 0, thread_id: int = 0) -> dict:
-    """Send MarkdownV2 text, chunked. Falls back to plain on parse error."""
+    """Send MarkdownV2 text, chunked. Falls back to plain on parse error.
+    Cek `d.get("ok")` eksplisit — tg_api BISA nyerah stlh retry 429 exhaust &
+    balikin {} TANPA raise exception, jadi cuma andalin try/except gak cukup
+    (kelihatan "sukses" padahal diam2 gagal). Kalau tetap gagal, SATU retry
+    lagi setelah jeda + logging — jawaban tak boleh hilang diam-diam."""
     parts = _split_chunks(md, 4000)
     res = {}
     for i, part in enumerate(parts):
@@ -683,17 +978,26 @@ def _send_raw(chat_id: int, md: str, reply_to: int = 0, thread_id: int = 0) -> d
             kw["message_thread_id"] = thread_id
         if reply_to and i == 0:
             kw["reply_to_message_id"] = reply_to
-        try:
-            res = tg_api("sendMessage", **kw)
-        except Exception:
-            # Fallback: strip MarkdownV2 escapes, send plain
-            plain = re.sub(r'\\([_*\[\]()~`>#+\-=|{}.!\\])', r'\1', part)
-            kw["text"] = plain[:4096]
-            kw.pop("parse_mode", None)
+        plain_kw = dict(kw)
+        plain_kw["text"] = re.sub(r'\\([_*\[\]()~`>#+\-=|{}.!\\])', r'\1', part)[:4096]
+        plain_kw.pop("parse_mode", None)
+
+        def _try(payload):
             try:
-                res = tg_api("sendMessage", **kw)
+                d = tg_api("sendMessage", **payload)
+                return d, bool(d.get("ok"))
             except Exception:
-                pass
+                return {}, False
+
+        res, ok = _try(kw)
+        if not ok:
+            res, ok = _try(plain_kw)          # mungkin parse error MarkdownV2
+        if not ok:
+            log(f"_send_raw: gagal kirim ke {chat_id} (part {i+1}/{len(parts)}), retry sekali…")
+            time.sleep(2.5)
+            res, ok = _try(plain_kw)          # retry terakhir, plain (paling aman)
+            if not ok:
+                log(f"_send_raw: retry terakhir JUGA gagal — pesan HILANG (chat_id={chat_id})")
     return res
 
 def send_msg(chat_id: int, text: str, reply_to: int = 0, thread_id: int = 0) -> dict:
@@ -713,8 +1017,35 @@ _PICK_RE = re.compile(r"\[\[PICK\]\](.*?)\[\[/PICK\]\]", re.DOTALL | re.IGNORECA
 _MULTIPICK_RE = re.compile(r"\[\[MULTIPICK\]\](.*?)\[\[/MULTIPICK\]\]", re.DOTALL | re.IGNORECASE)
 # pick_token -> list[str] of option texts (per chat). Keeps callback_data short.
 _pending_pick: dict = {}
-# multipick_token -> (options, set[int]) — tracks selected indices
+# multipick_token -> (options, set[int], [version]) — selected indices + versi
+# toggle (utk gugurkan edit keyboard BASI saat user nge-tap cepat beruntun)
 _pending_multipick: dict = {}
+# split_token -> body jawaban penuh (tombol "✂️ Pecah buat copy")
+_pending_split: dict = {}
+
+def _cap_pending(d: dict, cap: int = 200):
+    """Jaga dict pending gak tumbuh tanpa batas — entry tertua dianggap
+    kadaluarsa (dict Python 3.7+ terurut sesuai insersi)."""
+    while len(d) > cap:
+        d.pop(next(iter(d)))
+
+def _split_pieces(body: str, max_pieces: int = 40) -> list:
+    """Pecah jawaban jadi potongan kecil per paragraf / code-block untuk mode
+    "✂️ Pecah buat copy" — tiap potongan dikirim sebagai pesan sendiri biar
+    long-press → Copy dapet PERSIS bagian itu aja, gak perlu copy semuanya."""
+    parts = re.split(r"(```.*?```)", body or "", flags=re.DOTALL)
+    pieces = []
+    for p in parts:
+        if not p.strip():
+            continue
+        if p.startswith("```"):
+            pieces.append(p.strip())
+            continue
+        for para in p.split("\n\n"):
+            para = para.strip()
+            if para:
+                pieces.append(para)
+    return pieces[:max_pieces]
 
 def _parse_pick(text: str):
     """Return (clean_text, [options]) if a PICK block exists, else (text, None)."""
@@ -757,7 +1088,8 @@ def send_with_pick(chat_id: int, text: str, reply_to: int = 0, thread_id: int = 
     clean_mp, mp_options = _parse_multipick(text)
     if mp_options:
         tok = uuid.uuid4().hex[:8]
-        _pending_multipick[(chat_id, tok)] = (mp_options, set())
+        _pending_multipick[(chat_id, tok)] = (mp_options, set(), [0])
+        _cap_pending(_pending_multipick)
         # Build toggle buttons with ☐ prefix
         rows = [[{"text": f"☐ {opt[:38]}", "callback_data": f"mpick:{tok}:{i}"}]
                 for i, opt in enumerate(mp_options)]
@@ -785,6 +1117,7 @@ def send_with_pick(chat_id: int, text: str, reply_to: int = 0, thread_id: int = 
         return False
     tok = uuid.uuid4().hex[:8]
     _pending_pick[(chat_id, tok)] = options
+    _cap_pending(_pending_pick)
     rows = [[{"text": f"{i+1}. {opt[:40]}", "callback_data": f"pick:{tok}:{i}"}]
             for i, opt in enumerate(options)]
     kb = {"inline_keyboard": rows}
@@ -981,73 +1314,32 @@ def new_session(cid: int):
     }
     _save_store(cid)
 
-# ── Auto-compact (RESEED deterministik) ──────────────────────────────────────
-# Bot drives `claude -p` (headless one-shot per pesan), yang TIDAK punya
-# auto-compact loop interaktif → konteks membengkak tak terbatas.
-# CATATAN: `/compact` native via `--resume` TERBUKTI tidak reliable di mode -p —
-# file sesi append-only & bercabang, `--resume` sering nyasar balik ke cabang
-# lama yang gemuk (investigasi 2026-06-26: cuma nyangkut 1 dari 7×). Maka dipakai
-# RESEED: ringkas sesi lama → session_id BARU yang bersih (file linear, 0 cabang)
-# → ringkasan jadi seed pesan berikutnya. Deterministik: tiap kali pasti turun.
-#
-# Context window per SLOT model (opus/sonnet/haiku). Bisa beda kalau provider
-# underlying (DeepSeek/GLM dll) lebih kecil → override di config["context_windows"].
+# ── Context window per SLOT model ─────────────────────────────────────────────
+# Dipakai cuma buat NAMPILIN footer "ctx Nk/limitk" (info). Compaction sendiri
+# 100% diurus NATIVE Claude Code (client-side, jalan di mode -p juga) — bot TIDAK
+# lagi pakai RESEED. Investigasi 2026-07-01: isCompactSummary native terbukti
+# muncul di sesi bot. Override per provider via config["context_windows"].
 CONTEXT_WINDOWS = {"opus": 1_000_000, "sonnet": 1_000_000, "haiku": 200_000}
 CONTEXT_WINDOWS.update(CFG.get("context_windows", {}))
-# Fraksi window yang memicu auto-compact. 0 = nonaktif.
-AUTO_COMPACT_RATIO = CFG.get("auto_compact_ratio", 0.85)
 
-def _compact_threshold(model_slot: str = None) -> int:
-    """Ambang token (per slot model) pemicu auto-compact. 0 = nonaktif."""
-    if not AUTO_COMPACT_RATIO:
-        return 0
-    win = CONTEXT_WINDOWS.get(model_slot or MODEL_SLOT,
-                              CONTEXT_WINDOWS.get("opus", 1_000_000))
-    return int(win * AUTO_COMPACT_RATIO)
-
-_RESEED_SUMMARY_PROMPT = (
-    "Buat RINGKASAN HANDOFF dari SELURUH percakapan ini untuk dilanjutkan di "
-    "sesi baru yang kosong. Ringkasan ini akan jadi SATU-SATUNYA memori sesi "
-    "berikutnya, jadi harus cukup untuk melanjutkan tanpa kehilangan konteks. "
-    "Sertakan: (1) tujuan/tugas utama yang sedang dikerjakan; (2) keputusan "
-    "penting beserta alasannya; (3) file/path/perintah/identifier kunci; "
-    "(4) yang SUDAH selesai; (5) yang masih PENDING / langkah berikutnya; "
-    "(6) detail teknis yang tak boleh hilang. Langsung tulis ringkasannya — "
-    "padat tapi lengkap, tanpa kalimat pembuka/penutup."
-)
-
-def _reseed_compact(cid: int, win_name: str = None) -> tuple:
-    """Compact via RESEED (deterministik): ringkas sesi lama, lalu pindah ke
-    session_id BARU yang bersih; ringkasan disimpan sebagai `pending_seed` dan
-    disisipkan ke pesan user berikutnya. Menghindari masalah `--resume` yang
-    nyasar ke cabang lama gemuk. Sesi lama TIDAK dihapus (masih bisa di-resume
-    manual). Returns (ok, info)."""
-    store = _load_store(cid)
-    win_name = win_name or store.get("active", "main")
-    win = store.get("windows", {}).get(win_name)
-    if not win:
-        return False, "window tak ada"
-    wd = win.get("workdir", WORKDIR)
-    old_sid = win.get("session_id", "")
-    if not _session_exists(wd, old_sid):
-        return False, "sesi masih kosong (belum perlu dipangkas)"
-    # 1) Minta Claude meringkas seluruh sesi lama (handoff summary).
-    summary, _ = run_claude(_RESEED_SUMMARY_PROMPT, cid, wd, old_sid,
-                            provider=win.get("provider"), model=win.get("model"))
-    summary = (summary or "").strip()
-    if not summary:
-        return False, "ringkasan kosong (sesi lama tetap utuh)"
-    if "not enough messages" in summary.lower():
-        return False, "sesi masih terlalu pendek"
-    if summary[0] in "❌⏰⏹⚠️":
-        return False, "gagal meringkas (sesi lama tetap utuh, coba lagi)"
-    # 2) Pindah ke session_id BARU (file bersih) + simpan seed sekali-pakai.
-    win["session_id"] = str(uuid.uuid4())
-    win["pending_seed"] = summary
-    win.pop("ctx_tokens", None)
-    win.pop("needs_compact", None)
-    _save_store(cid)
-    return True, "ok"
+def _ctx_limit_from_model_usage(model_usage) -> int:
+    """Ukuran context window ASLI yg dilaporkan CLI (result.modelUsage[*]
+    .contextWindow) — bukan tebakan statis CONTEXT_WINDOWS. Multi-model
+    (subagent bisa pakai model lain) → pilih model pemegang konteks terbesar,
+    itu model utama percakapan. Return 0 kalau CLI belum lapor (versi lama)."""
+    best_used, lim = -1, 0
+    for m in (model_usage or {}).values():
+        try:
+            used = (int(m.get("inputTokens", 0) or 0)
+                    + int(m.get("cacheReadInputTokens", 0) or 0)
+                    + int(m.get("cacheCreationInputTokens", 0) or 0))
+            cw = int(m.get("contextWindow", 0) or 0)
+        except Exception:
+            continue
+        if cw and used > best_used:
+            best_used = used
+            lim = cw
+    return lim
 
 # ── Window management ───────────────────────────────────────────────────────
 def win_list(cid: int) -> list[dict]:
@@ -1058,6 +1350,72 @@ def win_list(cid: int) -> list[dict]:
     for name, w in store.get("windows", {}).items():
         result.append({"name": name, "active": name == active, **w})
     return result
+
+
+# ── Agent View (ala `claude agents` di terminal) ────────────────────────────
+# Di terminal: panah atas/bawah pilih sesi, Enter masuk. Di Telegram tak ada
+# panah, jadi padanannya: tiap window jadi TOMBOL inline yang di-tap untuk
+# pindah (set active). Window = "agent/sesi" paralel; yang lagi jalan = _busy.
+
+def _agentview_text(cid: int) -> str:
+    store = _load_store(cid)
+    active = store.get("active", "main")
+    wins = store.get("windows", {})
+    running = {w for (ci, w) in _busy if ci == cid}
+    if not wins:
+        return "🤖 *Agent View*\n\nBelum ada sesi. Kirim pesan untuk memulai."
+    n_run = len(running)
+    n_idle = len(wins) - n_run
+    lines = [f"🤖 *Agent View* — {len(wins)} sesi ({n_run} kerja · {n_idle} idle)\n"]
+    for name, w in wins.items():
+        is_act = name == active
+        if name in running:
+            state = "🟢 kerja"
+        else:
+            state = "⚪ idle"
+        here = " ← di sini" if is_act else ""
+        model = w.get("model", MODEL_SLOT)
+        prov = w.get("provider", PROVIDER)
+        qn = len(w.get("queue") or [])
+        extra = f" · antri {qn}" if qn else ""
+        lines.append(f"• *{name}* — {state} · `{prov}/{model}`{extra}{here}")
+    slots = MAX_CONCURRENT - _claude_slots._value
+    lines.append(f"\n⚙️ Slot global: {slots}/{MAX_CONCURRENT} dipakai")
+    lines.append("_Tap sesi untuk pindah. 🟢 = tap lagi untuk ⏹ stop._")
+    return "\n".join(lines)
+
+
+def _agentview_kb(cid: int) -> dict:
+    store = _load_store(cid)
+    active = store.get("active", "main")
+    wins = store.get("windows", {})
+    running = {w for (ci, w) in _busy if ci == cid}
+    rows = []
+    for name in wins:
+        is_act = name == active
+        mark = "🟢" if name in running else ("🎯" if is_act else "⚪")
+        label = f"{mark} {name[:28]}" + (" •" if is_act else "")
+        row = [{"text": label, "callback_data": f"av:sw:{name[:40]}"}]
+        # sesi yang lagi kerja → tombol ⏹ stop di sebelahnya
+        if name in running:
+            row.append({"text": "⏹", "callback_data": f"av:st:{name[:40]}"})
+        rows.append(row)
+    rows.append([
+        {"text": "🆕 Sesi baru", "callback_data": "av:new"},
+        {"text": "🔄 Segarkan", "callback_data": "av:rf"},
+    ])
+    rows.append([{"text": "✖️ Tutup", "callback_data": "m_close"}])
+    return {"inline_keyboard": rows}
+
+
+def _agentview_refresh(cid: int, mid: int):
+    """Perbarui panel Agent View di tempat (setelah pindah/stop/baru)."""
+    try:
+        tg_api("editMessageText", chat_id=cid, message_id=mid,
+               text=_to_md(_agentview_text(cid)), parse_mode="MarkdownV2",
+               reply_markup=_agentview_kb(cid))
+    except Exception:
+        pass
 
 def win_switch(cid: int, name: str, workdir: str = None) -> dict:
     """Switch to a window (create if not exists).
@@ -1251,6 +1609,273 @@ def _tool_label(name: str, inp: dict) -> str:
         return "📋 update rencana"
     return f"🔧 {name}"
 
+# Mode Hermes: narasi antar-langkah & tool call dikirim REAL-TIME sebagai
+# pesan2 kecil (kayak bot Hermes 137 di SS user) — bukan nunggu task kelar.
+HERMES_MODE = bool(CFG.get("hermes_mode", True))
+
+def _tool_line(name: str, inp: dict):
+    """Satu baris utk bubble progress tool gaya Hermes. Return (jenis, teks):
+    jenis 'bash' dirender fenced ```cmd``` di bawah header '💻 terminal'
+    (header di-dedup utk command beruntun — persis gateway Hermes), sisanya
+    baris label biasa. SEMUA tool masuk bubble — gak spam krn 1 bubble/batch."""
+    n = (name or "").lower()
+    inp = inp or {}
+    if n in ("bash", "shell"):
+        cmd = (inp.get("command") or "").strip()
+        return ("bash", cmd[:280]) if cmd else ("label", "💻 terminal")
+    return ("label", _tool_label(name, inp))
+
+# ── Warm pool: proses `claude` PERSISTENT per sesi ───────────────────────────
+# Tiap pesan yang spawn proses baru bayar startup penuh (load MCP + CLAUDE.md
+# + tool discovery ≈ 3-9 dtk). Dengan --input-format stream-json prosesnya
+# hidup terus: pesan berikutnya masuk via stdin → first-token ~1 dtk.
+# Pola sama persis dgn warm_pool.py di cc-tg-web (sudah jalan produksi).
+WARM_ENABLED = bool(CFG.get("warm_pool", True))
+WARM_TTL = int(CFG.get("warm_ttl", 900))   # dtk idle sebelum proses dimatikan
+WARM_MAX = int(CFG.get("warm_max", 3))     # maks proses hidup (≈300MB RAM/proses)
+
+class _WarmCancelled(Exception):
+    pass
+
+class _WarmTimeout(Exception):
+    pass
+
+def _handle_stream_ev(ev: dict, holder: dict, _emit):
+    """Proses SATU event NDJSON dari claude CLI: sinkronkan holder (result,
+    usage, buffer teks) + emit event sintetis stream_text/stream_think.
+    Dipakai jalur cold DAN warm supaya rendering live-nya identik."""
+    if ev.get("type") == "assistant":
+        # ⚠️ URUTAN CLI (terbukti probe 2026-07-02): event
+        # `assistant [text]` keluar SEBELUM content_block_stop
+        # turn yg sama → flush stop yg telat bisa ngisi ulang
+        # buffer & bikin preview segmen BARU pasca-seal (pesan
+        # dobel + kursor nyangkut). Kosongkan buffer di sini
+        # (thread sama, ordered) supaya flush telat = no-op.
+        for _b in ev.get("message", {}).get("content", []) or []:
+            if isinstance(_b, dict) and _b.get("type") == "text":
+                holder["text_buf"] = ""
+                holder["text_sent"] = 0
+                break
+        # Track true context size (input + cache) — used for
+        # auto-compact. Result-event usage sometimes omits
+        # cache fields, so we keep the max seen as fallback.
+        mu = ev.get("message", {}).get("usage", {}) or {}
+        c = (mu.get("input_tokens", 0)
+             + mu.get("cache_read_input_tokens", 0)
+             + mu.get("cache_creation_input_tokens", 0))
+        if c:
+            holder["ctx_seen"] = max(holder.get("ctx_seen", 0), c)
+    if ev.get("type") == "result":
+        holder["result"] = (ev.get("result") or "").strip()
+        u = ev.get("usage", {}) or {}
+        cr = u.get("cache_read_input_tokens", 0)
+        cc = u.get("cache_creation_input_tokens", 0)
+        it = u.get("input_tokens", 0)
+        ctx = it + cr + cc
+        holder["usage"] = {
+            "tokens": (it + u.get("output_tokens", 0)),
+            # true prompt size sent this turn (what drives cost)
+            "context": max(ctx, holder.get("ctx_seen", 0)),
+            # window ASLI dari CLI (0 = gak dilaporkan)
+            "ctx_limit": _ctx_limit_from_model_usage(
+                ev.get("modelUsage")),
+            "cache_read": cr,
+            "cost": ev.get("total_cost_usd", 0) or 0,
+            "turns": ev.get("num_turns", 0),
+            "ms": ev.get("duration_ms", 0),
+        }
+    # ── Partial-message streaming: unwrap stream_event
+    # deltas into synthetic events so the live feed renders
+    # token-by-token. (Deltas only arrive because of
+    # --include-partial-messages on the claude call.)
+    if ev.get("type") == "stream_event":
+        se = ev.get("event", {}) or {}
+        et = se.get("type")
+        if et == "message_start":
+            # new turn → reset buffers, stream each turn fresh
+            holder["text_buf"] = ""; holder["text_sent"] = 0
+            holder["think_buf"] = ""; holder["think_sent"] = 0
+            _emit({"type": "stream_text", "text": ""})
+            _emit({"type": "stream_think", "text": ""})
+        elif et == "content_block_delta":
+            d = se.get("delta", {}) or {}
+            if d.get("type") == "text_delta":
+                # Emit SETIAP delta (tanpa gate char): biar
+                # self.text selalu paling baru. Throttle Telegram
+                # diurus flusher LiveStream — gate di sini cuma
+                # bikin token pertama telat. (lebih instan)
+                holder["text_buf"] = holder.get("text_buf", "") + (d.get("text", "") or "")
+                _emit({"type": "stream_text", "text": holder["text_buf"]})
+            elif d.get("type") == "thinking_delta":
+                holder["think_buf"] = holder.get("think_buf", "") + (d.get("thinking", "") or "")
+                _emit({"type": "stream_think", "text": holder["think_buf"]})
+        elif et == "content_block_stop":
+            # flush the tail so the last partial chunk shows
+            if len(holder.get("text_buf", "")) - holder.get("text_sent", 0) > 0:
+                holder["text_sent"] = len(holder["text_buf"])
+                _emit({"type": "stream_text", "text": holder["text_buf"]})
+            if len(holder.get("think_buf", "")) - holder.get("think_sent", 0) > 0:
+                holder["think_sent"] = len(holder["think_buf"])
+                _emit({"type": "stream_think", "text": holder["think_buf"]})
+    _emit(ev)
+
+class _WarmProc:
+    """Satu proses claude persistent untuk satu sesi."""
+    def __init__(self, chat_id, workdir, session_id, provider, model, effort):
+        self.chat_id = chat_id
+        self.workdir = workdir
+        self.session_id = session_id
+        self.provider = provider
+        self.model = model
+        self.effort = effort
+        self.last_used = time.time()
+        self.proc = self._spawn()
+
+    def _spawn(self):
+        env = os.environ.copy()
+        env["TELEGRAM_BOT_TOKEN"] = TG_TOKEN
+        env["TELEGRAM_CHAT_ID"] = str(self.chat_id)
+        _provider_env(env, self.provider)
+        if _session_exists(self.workdir, self.session_id):
+            try:
+                _repair_session(self.workdir, self.session_id)
+            except Exception:
+                pass
+            flag = "--resume"
+        else:
+            flag = "--session-id"
+        cmd = [get_claude_bin(self.provider), "-p", flag, self.session_id,
+               "--model", self.model,
+               "--output-format", "stream-json",
+               "--input-format", "stream-json",
+               "--verbose", "--include-partial-messages",
+               "--append-system-prompt", TELE_SYSTEM_PROMPT]
+        if self.effort and self.effort in EFFORT_LEVELS:
+            cmd += ["--effort", self.effort]
+        cmd.append("--dangerously-skip-permissions")
+        # stderr → DEVNULL: kalau turn warm gagal, fallback cold yang
+        # nangkep detail errornya. start_new_session → kill 1 pohon (MCP dkk).
+        return subprocess.Popen(cmd, cwd=self.workdir, env=env,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, start_new_session=True)
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def matches(self, workdir, provider, model, effort):
+        return (self.workdir == workdir and self.provider == provider
+                and self.model == model and self.effort == effort)
+
+    def kill(self):
+        try:
+            _kill_process_tree(self.proc)
+        except Exception:
+            pass
+
+    def run_turn(self, prompt, on_event, lock_key):
+        """Kirim 1 pesan via stdin, baca event sampai `result` (proses TETAP
+        hidup buat turn berikutnya). Raise: _WarmCancelled (di-/stop),
+        _WarmTimeout, RuntimeError (proses/stdin mati → caller fallback cold)."""
+        def _emit(e):
+            if on_event:
+                try:
+                    on_event(e)
+                except Exception:
+                    pass
+        msg = {"type": "user", "message": {"role": "user",
+               "content": [{"type": "text", "text": prompt}]}}
+        try:
+            self.proc.stdin.write((json.dumps(msg) + "\n").encode())
+            self.proc.stdin.flush()
+        except Exception as e:
+            raise RuntimeError(f"warm stdin putus: {e}")
+        self.last_used = time.time()
+
+        holder = {"result": "", "usage": {}}
+        done = threading.Event()
+        got = {"result": False}
+
+        def _reader():
+            try:
+                for raw in self.proc.stdout:
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    _handle_stream_ev(ev, holder, _emit)
+                    if ev.get("type") == "result":
+                        got["result"] = True
+                        return      # SISAKAN stdout untuk turn berikutnya
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+        start = time.time()
+        while not done.is_set():
+            if lock_key is not None and lock_key in _cancelled:
+                self.kill()
+                raise _WarmCancelled()
+            if time.time() - start > CLAUDE_TIMEOUT:
+                self.kill()
+                raise _WarmTimeout()
+            done.wait(0.5)
+        # Tombol ⏹ Stop bisa kill proses DULUAN (via _running_procs) sebelum
+        # loop di atas lihat _cancelled → reader EOF. Cek lagi di sini supaya
+        # cancel TIDAK dianggap crash (crash = fallback cold = prompt jalan 2x).
+        if lock_key is not None and lock_key in _cancelled:
+            raise _WarmCancelled()
+        if not got["result"]:
+            raise RuntimeError("warm proc berakhir tanpa result")
+        self.last_used = time.time()
+        return _strip_ansi(holder["result"]), holder["usage"]
+
+class _WarmPool:
+    def __init__(self):
+        self._procs = {}                 # session_id -> _WarmProc
+        self._lock = threading.Lock()
+        threading.Thread(target=self._janitor, daemon=True).start()
+
+    def get(self, chat_id, workdir, session_id, provider, model, effort):
+        with self._lock:
+            wp = self._procs.get(session_id)
+            if wp and (not wp.alive()
+                       or not wp.matches(workdir, provider, model, effort)):
+                wp.kill()                # model/provider ganti → respawn
+                self._procs.pop(session_id, None)
+                wp = None
+            if wp is None:
+                while len(self._procs) >= WARM_MAX:
+                    oldest = min(self._procs.values(), key=lambda w: w.last_used)
+                    oldest.kill()
+                    self._procs.pop(oldest.session_id, None)
+                wp = _WarmProc(chat_id, workdir, session_id,
+                               provider, model, effort)
+                self._procs[session_id] = wp
+            return wp
+
+    def discard(self, session_id):
+        with self._lock:
+            wp = self._procs.pop(session_id, None)
+        if wp:
+            wp.kill()
+
+    def _janitor(self):
+        while True:
+            time.sleep(60)
+            now = time.time()
+            with self._lock:
+                stale = [sid for sid, w in self._procs.items()
+                         if (not w.alive()) or now - w.last_used > WARM_TTL]
+                for sid in stale:
+                    self._procs[sid].kill()
+                    self._procs.pop(sid, None)
+
+_WARM = _WarmPool()
+
 def run_claude(prompt: str, chat_id: int, workdir: str, session_id: str,
                provider: str = None, model: str = None,
                lock_key=None, on_event=None, effort: str = None) -> tuple:
@@ -1266,6 +1891,60 @@ def run_claude(prompt: str, chat_id: int, workdir: str, session_id: str,
     bin_path = get_claude_bin(provider)
     _provider_env(env, provider)  # inject base_url/token/model for this provider
     model_slot = model or MODEL_SLOT
+
+    # ⚡ Ukur first-token latency (muncul di journal — bukti cepat/lambat nyata)
+    _t0 = time.time()
+    _ft = {"seen": False, "path": "cold"}
+    _user_ev = on_event
+    def on_event(e, __oe=_user_ev):
+        if (not _ft["seen"]) and (
+                (e.get("type") in ("stream_text", "stream_think") and e.get("text"))
+                or e.get("type") == "assistant"):
+            _ft["seen"] = True
+            log(f"⚡ first-token {time.time()-_t0:.1f}s ({_ft['path']}) sesi {session_id[:8]}")
+        if __oe:
+            __oe(e)
+
+    # ── JALUR WARM: proses persistent (MCP load 1x → first-token ~1 dtk) ────
+    # Slash-command (mis. /compact) tetap cold: dia memutasi jsonl sesi, jadi
+    # proses warm sesi itu dibuang dulu biar konteks in-memory-nya gak basi.
+    if (prompt or "").lstrip().startswith("/"):
+        _WARM.discard(session_id)
+    elif WARM_ENABLED:
+        wp = None
+        try:
+            wp = _WARM.get(chat_id, workdir, session_id, provider, model_slot,
+                           effort if effort in EFFORT_LEVELS else None)
+        except Exception as e:
+            log(f"warm spawn gagal → cold: {e}")
+        if wp is not None:
+            if lock_key is not None:
+                _running_procs[lock_key] = wp.proc
+            _ft["path"] = "warm"
+            try:
+                result_text, usage = wp.run_turn(prompt, on_event, lock_key)
+                if result_text:
+                    if usage:
+                        p = provider or PROVIDER
+                        slot = _usage_log.setdefault(p, {"tokens": 0, "cost": 0.0, "calls": 0})
+                        slot["tokens"] += usage.get("tokens", 0)
+                        slot["cost"] += usage.get("cost", 0)
+                        slot["calls"] += 1
+                    return result_text, usage
+                _WARM.discard(session_id)   # result kosong → coba jalur cold
+            except _WarmCancelled:
+                _WARM.discard(session_id)
+                return "⏹ Dibatalkan.", {}
+            except _WarmTimeout:
+                _WARM.discard(session_id)
+                return f"⏰ Timeout (>{CLAUDE_TIMEOUT//60} menit). Coba /reset.", {}
+            except Exception as e:
+                log(f"warm turn gagal → fallback cold: {e}")
+                _WARM.discard(session_id)
+            finally:
+                if lock_key is not None:
+                    _running_procs.pop(lock_key, None)
+            _ft["path"] = "cold"
 
     def _cmd(sid, resume):
         flag = "--resume" if resume else "--session-id"
@@ -1330,66 +2009,8 @@ def run_claude(prompt: str, chat_id: int, workdir: str, session_id: str,
                             ev = json.loads(line)
                         except Exception:
                             continue
-                        if ev.get("type") == "assistant":
-                            # Track true context size (input + cache) — used for
-                            # auto-compact. Result-event usage sometimes omits
-                            # cache fields, so we keep the max seen as fallback.
-                            mu = ev.get("message", {}).get("usage", {}) or {}
-                            c = (mu.get("input_tokens", 0)
-                                 + mu.get("cache_read_input_tokens", 0)
-                                 + mu.get("cache_creation_input_tokens", 0))
-                            if c:
-                                holder["ctx_seen"] = max(holder.get("ctx_seen", 0), c)
-                        if ev.get("type") == "result":
-                            holder["result"] = (ev.get("result") or "").strip()
-                            u = ev.get("usage", {}) or {}
-                            cr = u.get("cache_read_input_tokens", 0)
-                            cc = u.get("cache_creation_input_tokens", 0)
-                            it = u.get("input_tokens", 0)
-                            ctx = it + cr + cc
-                            holder["usage"] = {
-                                "tokens": (it + u.get("output_tokens", 0)),
-                                # true prompt size sent this turn (what drives cost)
-                                "context": max(ctx, holder.get("ctx_seen", 0)),
-                                "cache_read": cr,
-                                "cost": ev.get("total_cost_usd", 0) or 0,
-                                "turns": ev.get("num_turns", 0),
-                                "ms": ev.get("duration_ms", 0),
-                            }
-                        # ── Partial-message streaming: unwrap stream_event
-                        # deltas into synthetic events so the live feed renders
-                        # token-by-token. (Deltas only arrive because of
-                        # --include-partial-messages on the claude call.)
-                        if ev.get("type") == "stream_event":
-                            se = ev.get("event", {}) or {}
-                            et = se.get("type")
-                            if et == "message_start":
-                                # new turn → reset buffers, stream each turn fresh
-                                holder["text_buf"] = ""; holder["text_sent"] = 0
-                                holder["think_buf"] = ""; holder["think_sent"] = 0
-                                _emit({"type": "stream_text", "text": ""})
-                                _emit({"type": "stream_think", "text": ""})
-                            elif et == "content_block_delta":
-                                d = se.get("delta", {}) or {}
-                                if d.get("type") == "text_delta":
-                                    # Emit SETIAP delta (tanpa gate char): biar
-                                    # self.text selalu paling baru. Throttle Telegram
-                                    # diurus flusher LiveStream — gate di sini cuma
-                                    # bikin token pertama telat. (lebih instan)
-                                    holder["text_buf"] = holder.get("text_buf", "") + (d.get("text", "") or "")
-                                    _emit({"type": "stream_text", "text": holder["text_buf"]})
-                                elif d.get("type") == "thinking_delta":
-                                    holder["think_buf"] = holder.get("think_buf", "") + (d.get("thinking", "") or "")
-                                    _emit({"type": "stream_think", "text": holder["think_buf"]})
-                            elif et == "content_block_stop":
-                                # flush the tail so the last partial chunk shows
-                                if len(holder.get("text_buf", "")) - holder.get("text_sent", 0) > 0:
-                                    holder["text_sent"] = len(holder["text_buf"])
-                                    _emit({"type": "stream_text", "text": holder["text_buf"]})
-                                if len(holder.get("think_buf", "")) - holder.get("think_sent", 0) > 0:
-                                    holder["think_sent"] = len(holder["think_buf"])
-                                    _emit({"type": "stream_think", "text": holder["think_buf"]})
-                        _emit(ev)
+                        # parsing result/usage/deltas: SATU sumber, sama dgn warm
+                        _handle_stream_ev(ev, holder, _emit)
                 finally:
                     _done.set()
             t_out = _t.Thread(target=_reader, daemon=True); t_out.start()
@@ -1507,9 +2128,7 @@ Di grup pakai Topics: tiap topic = project terpisah
 
 **💰 Pemakaian & Otomasi**
 • `/cost` — token & biaya per provider
-• `/cron` — daftar jadwal otomatis
-• `/cron add 07:00 <tugas>` — jadwal harian
-• `/cron del <n>` — hapus jadwal
+• `/cron` — jadwal otomatis (tombol ⏰ Cron = wizard lengkap: harian/mingguan/interval/sekali, pause, run-now, edit)
 
 **🆕 Sesi & window**
 • `/new [nama]` — window/sesi baru (fresh context)
@@ -1534,8 +2153,8 @@ Di grup pakai Topics: tiap topic = project terpisah
 
 	**🧠 Reasoning & konteks**
 	• `/effort [level]` — atur kedalaman mikir (low→max) · `/verbose` — tampil thinking live
-	• `/compress` (`/compact`) `[here N]` — ringkas konteks percakapan (hemat token)
 	• `/undo [N]` — mundur N turn terakhir (default 1)
+	• `/compact` — ringkas konteks sesi sekarang (native, kayak di terminal)
 	• `/clear` — bersihkan layar, sesi baru
 	• `/effort <level>` — low/medium/high/xhigh/max
 
@@ -1560,7 +2179,7 @@ REPLY_KB = {
     "keyboard": [
         [{"text": "💬 Sesi"}, {"text": "🪟 Project"}],
         [{"text": "🔌 Provider"}, {"text": "🧠 Model"}, {"text": "🎯 Effort"}],
-        [{"text": "📋 Menu"}, {"text": "⏹ Stop"}],
+        [{"text": "⏰ Cron"}, {"text": "📋 Menu"}, {"text": "⏹ Stop"}],
     ],
     "resize_keyboard": True,
     "one_time_keyboard": False,
@@ -1574,6 +2193,7 @@ QUICK_BTN = {
     "🔌 Provider": "/provider",
     "🧠 Model": "_MODELKB_",
     "🎯 Effort": "_EFFORTKB_",
+    "⏰ Cron": "_CRONKB_",
     "📋 Menu": "/menu",
     "⏹ Stop": "/stop",
 }
@@ -1585,8 +2205,7 @@ MENU_KB = {"inline_keyboard": [
     [{"text": "📊 Disk", "callback_data": "m_disk"},
      {"text": "📊 Status", "callback_data": "m_status"}],
     [{"text": "💰 Usage", "callback_data": "m_usage"},
-     {"text": "🤖 Agents", "callback_data": "m_agents"},
-     {"text": "⏰ Cron", "callback_data": "m_cron"}],
+     {"text": "🤖 Agents", "callback_data": "m_agents"}],
     [{"text": "🆕 Sesi Baru", "callback_data": "m_reset"},
      {"text": "⬇️ Update", "callback_data": "m_update"}],
     [{"text": "🚪 Exit", "callback_data": "m_exit"},
@@ -1755,6 +2374,56 @@ def handle_callback(cb: dict):
             pass
         return
 
+    # ── Agent View: pindah sesi / stop / baru / refresh ──────────────────────
+    if data.startswith("av:"):
+        sub = data[3:]
+        if sub.startswith("sw:"):           # pindah (switch) ke window
+            name = sub[3:]
+            if name in _load_store(cid).get("windows", {}):
+                win_switch(cid, name)
+            _agentview_refresh(cid, mid)
+        elif sub.startswith("st:"):         # stop task di window itu
+            name = sub[3:]
+            lk = (cid, name)
+            _cancelled.add(lk)
+            p = _running_procs.get(lk)
+            if p:
+                _kill_process_tree(p)
+            _busy.discard(lk)
+            _agentview_refresh(cid, mid)
+        elif sub == "new":                  # sesi baru di window aktif
+            new_session(cid)
+            _agentview_refresh(cid, mid)
+        elif sub == "rf":                   # refresh
+            _agentview_refresh(cid, mid)
+        return
+
+    # "✂️ Pecah buat copy": kirim ulang jawaban sbg pesan-pesan kecil per
+    # paragraf/code-block — long-press → Copy dapet persis bagian itu aja.
+    if data.startswith("split:"):
+        sp_tok = data.split(":", 1)[1]
+        body = _pending_split.pop(sp_tok, None)
+        sp_thread = cb["message"].get("message_thread_id", 0)
+        try:
+            # tombol dilepas biar gak dobel-tap (sekali pakai)
+            tg_api("editMessageReplyMarkup", chat_id=cid, message_id=mid,
+                   reply_markup={"inline_keyboard": []})
+        except Exception:
+            pass
+        if not body:
+            try:
+                tg_api("sendMessage", chat_id=cid, parse_mode="",
+                       text="⌛ Jawaban ini sudah kadaluarsa dari memori (bot restart / kelamaan).")
+            except Exception:
+                pass
+            return
+        def _send_pieces():
+            for pc in _split_pieces(body):
+                for chunk in _split_chunks(pc, 4000):
+                    _send_raw(cid, _to_md(chunk), 0, sp_thread)
+        threading.Thread(target=_send_pieces, daemon=True).start()
+        return
+
     # MULTIPICK: toggle an option on/off
     if data.startswith("mpick:"):
         try:
@@ -1764,8 +2433,16 @@ def handle_callback(cb: dict):
             return
         entry = _pending_multipick.get((cid, tok))
         if not entry:
+            # Token kadaluarsa (bot sempat restart) — kasih tahu, jangan diam.
+            try:
+                tg_api("editMessageReplyMarkup", chat_id=cid, message_id=mid,
+                       reply_markup={"inline_keyboard": []})
+                tg_api("sendMessage", chat_id=cid, parse_mode="",
+                       text="⌛ Pilihan ini kadaluarsa (bot sempat restart). Ketik jawabannya manual ya.")
+            except Exception:
+                pass
             return
-        options, selected = entry
+        options, selected, ver = entry
         if not (0 <= idx < len(options)):
             return
         # Toggle
@@ -1773,7 +2450,11 @@ def handle_callback(cb: dict):
             selected.discard(idx)
         else:
             selected.add(idx)
-        # Rebuild keyboard with updated toggles
+        # Rebuild keyboard. Versi naik tiap tap: kalau user nge-tap beruntun
+        # cepat, edit2 LAMA yg masih ngantri gerbang digugurkan (_abort) — cuma
+        # keadaan TERAKHIR yg dirender → toggle kerasa responsif, gak antre 1-1.
+        ver[0] += 1
+        my_ver = ver[0]
         rows = [[{"text": f"{'☑️' if j in selected else '☐'} {opt[:38]}",
                   "callback_data": f"mpick:{tok}:{j}"}]
                 for j, opt in enumerate(options)]
@@ -1782,7 +2463,7 @@ def handle_callback(cb: dict):
         kb = {"inline_keyboard": rows}
         try:
             tg_api("editMessageReplyMarkup", chat_id=cid, message_id=mid,
-                   reply_markup=kb)
+                   reply_markup=kb, _abort=lambda: ver[0] != my_ver)
         except Exception:
             pass
         return
@@ -1790,23 +2471,27 @@ def handle_callback(cb: dict):
     # MULTIPICK: confirm and submit all selected options
     if data.startswith("mpdone:"):
         _, tok = data.split(":", 1)
-        entry = _pending_multipick.pop((cid, tok), None)
+        entry = _pending_multipick.get((cid, tok))
         if not entry:
             try:
                 tg_api("editMessageReplyMarkup", chat_id=cid, message_id=mid,
                        reply_markup={"inline_keyboard": []})
+                tg_api("sendMessage", chat_id=cid, parse_mode="",
+                       text="⌛ Pilihan ini kadaluarsa (bot sempat restart). Ketik jawabannya manual ya.")
             except Exception:
                 pass
             return
-        options, selected = entry
+        options, selected = entry[0], entry[1]
         if not selected:
-            # User clicked done but nothing selected
+            # Belum milih apa-apa → alert, dan entry JANGAN di-pop dulu —
+            # dulu keburu di-pop di sini, jadi habis alert tombol2nya mati semua.
             try:
                 tg_api("answerCallbackQuery", callback_query_id=cb_id,
                        text="Pilih dulu minimal satu opsi!", show_alert=True)
             except Exception:
                 pass
             return
+        _pending_multipick.pop((cid, tok), None)   # submit beneran → baru dilepas
         # Build comma-separated selection
         chosen = [options[i] for i in sorted(selected)]
         choice_text = ", ".join(chosen)
@@ -2015,7 +2700,7 @@ def handle_callback(cb: dict):
     elif data == "m_agents":
         send_msg(cid, cmd(cid, "/agents", None) or "🤖 Tidak ada task berjalan.")
     elif data == "m_cron":
-        send_msg(cid, cmd(cid, "/cron", None) or "⏰ Belum ada jadwal.")
+        edit_md(cid, mid, _cron_panel_text(cid), reply_markup=_cron_panel_kb(cid))
     elif data == "m_model":
         edit_md(cid, mid, "⚙️ Pilih model:", reply_markup=MODEL_KB)
     elif data == "m_effort":
@@ -2041,6 +2726,138 @@ def handle_callback(cb: dict):
             sess["effort"] = lvl
             save_sess(cid)
             edit_md(cid, mid, f"🎯 Effort window **{win}** → `{lvl}`\n\n(makin tinggi = mikir lebih dalam, lebih lama/mahal)\nKirim pesan untuk lanjut.")
+    # ── Cron callbacks ────────────────────────────────────────────────────
+    elif data == "cron_panel":
+        edit_md(cid, mid, _cron_panel_text(cid), reply_markup=_cron_panel_kb(cid))
+    elif data == "cron_add":
+        st = {"step": "type", "data": {}}
+        if _cb_thread:
+            st["thread_id"] = _cb_thread
+        _pending_cron[cid] = st
+        _cron_start_wizard(cid, mid)
+    elif data == "cron_cancel":
+        _pending_cron.pop(cid, None)
+        edit_md(cid, mid, _cron_panel_text(cid), reply_markup=_cron_panel_kb(cid))
+    elif data.startswith("crontype:"):
+        t = data.split(":", 1)[1]
+        st = _pending_cron.get(cid)
+        if not st:
+            edit_md(cid, mid, "↩️ Wizard kadaluarsa.", reply_markup=_cron_panel_kb(cid))
+        else:
+            st["data"]["type"] = t
+            if t == "daily":
+                st["step"] = "time"; _cron_ask_time(cid, mid)
+            elif t == "weekly":
+                st["step"] = "days"; st["data"]["days"] = []
+                edit_md(cid, mid, "➕ *Tambah Jadwal* — Mingguan\n\nPilih *hari* (boleh lebih dari satu):",
+                        reply_markup=_cron_days_kb([]))
+            elif t == "interval":
+                st["step"] = "interval"
+                edit_md(cid, mid, "➕ *Tambah Jadwal* — Interval\n\nJalankan *tiap berapa jam*?",
+                        reply_markup=_CRON_INTERVAL_KB)
+            elif t == "once":
+                st["step"] = "date"; _cron_ask_date(cid, mid)
+    elif data.startswith("cronday:"):
+        st = _pending_cron.get(cid)
+        if st and st.get("step") == "days":
+            d = int(data.split(":", 1)[1])
+            sel = st["data"].setdefault("days", [])
+            sel.remove(d) if d in sel else sel.append(d)
+            edit_md(cid, mid, "➕ *Tambah Jadwal* — Mingguan\n\nPilih *hari* (boleh lebih dari satu):",
+                    reply_markup=_cron_days_kb(sel))
+    elif data == "cronday_done":
+        st = _pending_cron.get(cid)
+        if st and st["data"].get("days"):
+            st["step"] = "time"; _cron_ask_time(cid, mid)
+        else:
+            tg_api("answerCallbackQuery", callback_query_id=cb_id, text="Pilih minimal 1 hari")
+    elif data.startswith("cronival:"):
+        st = _pending_cron.get(cid)
+        if st:
+            st["data"]["interval_h"] = int(data.split(":", 1)[1])
+            st["step"] = "win"; _cron_ask_win(cid, mid)
+    elif data.startswith("crondate:"):
+        st = _pending_cron.get(cid)
+        if st:
+            st["data"]["date"] = data.split(":", 1)[1]
+            st["step"] = "time"; _cron_ask_time(cid, mid)
+    elif data.startswith("cronhh:"):
+        st = _pending_cron.get(cid)
+        if st:
+            hh = int(data.split(":", 1)[1])
+            st["data"]["_hh"] = hh
+            edit_md(cid, mid, f"➕ *Tambah Jadwal* — Menit\n\nJam *{hh:02d}* — pilih *menit*:",
+                    reply_markup=_cron_min_kb(hh))
+    elif data == "cronhh_back":
+        _cron_ask_time(cid, mid)
+    elif data.startswith("cronmm:"):
+        st = _pending_cron.get(cid)
+        if st:
+            hh = st["data"].get("_hh", 7)
+            mm = int(data.split(":", 1)[1])
+            st["data"]["time"] = f"{hh:02d}:{mm:02d}"
+            st["data"].pop("_hh", None)
+            st["step"] = "win"; _cron_ask_win(cid, mid)
+    elif data.startswith("cronsid:"):
+        st = _pending_cron.get(cid)
+        if st:
+            arg = data.split(":", 1)[1]
+            if arg == "sep":
+                st["data"]["target_win"] = "cron"
+                st["data"].pop("target_sid", None)
+            else:
+                try:
+                    s = _sess_cache.get(cid, [])[int(arg)]
+                    st["data"]["target_win"] = "session"
+                    st["data"]["target_sid"] = s["id"]
+                    st["data"]["target_title"] = (s.get("title") or s.get("summary") or s["id"][:8])[:40]
+                except Exception:
+                    st["data"]["target_win"] = "cron"
+            st["step"] = "prompt"; _cron_ask_prompt(cid, mid)
+    elif data.startswith("cronview:"):
+        j = _job_by_id(data.split(":", 1)[1])
+        if j:
+            edit_md(cid, mid, _cron_job_text(j), reply_markup=_cron_job_kb(j))
+        else:
+            edit_md(cid, mid, _cron_panel_text(cid), reply_markup=_cron_panel_kb(cid))
+    elif data.startswith("cronrun:"):
+        jid = data.split(":", 1)[1]
+        j = _job_by_id(jid)
+        if j:
+            tg_api("answerCallbackQuery", callback_query_id=cb_id, text="🚀 Dijalankan…")
+            _job_update(jid, run_count=j.get("run_count", 0) + 1,
+                        last_run=datetime.now().isoformat(timespec="seconds"))
+            threading.Thread(target=_run_cron_job, args=(dict(j),), daemon=True).start()
+            j2 = _job_by_id(jid)
+            edit_md(cid, mid, _cron_job_text(j2), reply_markup=_cron_job_kb(j2))
+    elif data.startswith("cronpause:"):
+        jid = data.split(":", 1)[1]
+        _job_update(jid, enabled=False)
+        j = _job_by_id(jid)
+        edit_md(cid, mid, _cron_job_text(j), reply_markup=_cron_job_kb(j))
+    elif data.startswith("cronresume:"):
+        jid = data.split(":", 1)[1]
+        _job_update(jid, enabled=True)
+        j = _job_by_id(jid)
+        edit_md(cid, mid, _cron_job_text(j), reply_markup=_cron_job_kb(j))
+    elif data.startswith("croneditprompt:"):
+        jid = data.split(":", 1)[1]
+        _pending_cron[cid] = {"step": "editprompt", "jid": jid}
+        edit_md(cid, mid, "✏️ Ketik *tugas baru* untuk jadwal ini (ganti prompt lama).",
+                reply_markup={"inline_keyboard": [[{"text": "✖️ Batal", "callback_data": f"cronview:{jid}"}]]})
+    elif data.startswith("crondel:"):
+        jid = data.split(":", 1)[1]
+        j = _job_by_id(jid)
+        lbl = (j.get("title") or j.get("prompt", ""))[:40] if j else jid
+        edit_md(cid, mid, f"🗑️ Hapus jadwal ini?\n\n*{_sched_label(j) if j else ''}*\n`{lbl}`",
+                reply_markup={"inline_keyboard": [
+                    [{"text": "✅ Ya, hapus", "callback_data": f"crondelok:{jid}"},
+                     {"text": "↩️ Batal", "callback_data": f"cronview:{jid}"}]]})
+    elif data.startswith("crondelok:"):
+        _job_delete(data.split(":", 1)[1])
+        edit_md(cid, mid, "🗑️ Jadwal dihapus.\n\n" + _cron_panel_text(cid),
+                reply_markup=_cron_panel_kb(cid))
+
     elif data == "m_provider":
         sess = load_sess(cid)
         edit_md(cid, mid, f"🔌 Pilih provider (window ini: `{sess.get('provider', DEFAULT_PROVIDER)}`):",
@@ -2083,13 +2900,13 @@ def handle_callback(cb: dict):
             sess["session_id"] = s["id"]
             save_sess(cid)
             label = s["summary"] if s["summary"] else "(tanpa judul)"
-            hist = _session_recent_history(sess["workdir"], s["id"], n_pairs=3)
+            hist = _session_recent_history(sess["workdir"], s["id"], n_pairs=5)
             msg = (f"✅ *Lanjut sesi*\n\n"
                    f"💬 {label}\n"
                    f"🕐 {_rel_time(s.get('mtime', 0))} · `{s['id'][:8]}` · `{PROVIDER}`\n")
             if hist:
-                msg += f"\n*📜 Obrolan terakhir:*\n{hist}\n"
-            msg += "\nKirim pesan untuk lanjut."
+                msg += f"\n━━━ *📜 Obrolan terakhir* ━━━\n\n{hist}\n"
+            msg += "\n_Kirim pesan untuk lanjut._"
             edit_md(cid, mid, msg)
         else:
             edit_md(cid, mid, "❌ Sesi tidak ditemukan (mungkin sudah refresh). Ketik /resume lagi.")
@@ -2490,9 +3307,10 @@ def _msg_text(d: dict) -> str:
         return " ".join(parts).strip()
     return ""
 
-def _session_recent_history(workdir: str, session_id: str, n_pairs: int = 3) -> str:
+def _session_recent_history(workdir: str, session_id: str, n_pairs: int = 5) -> str:
     """Return the last few user/assistant exchanges of a session, formatted
-    for a Telegram preview. Reads only the file tail (fast even for huge files)."""
+    for a Telegram preview. Reads only the file tail (fast even for huge files).
+    Catatan: ini cuma TAMPILAN biar user inget — Claude tetap resume FULL sesi."""
     proj = _cc_project_dir(workdir)
     if not proj:
         return ""
@@ -2525,14 +3343,31 @@ def _session_recent_history(workdir: str, session_id: str, n_pairs: int = 3) -> 
     if not msgs:
         return ""
     msgs = msgs[-(n_pairs * 2):]
-    lines = []
+
+    def _clip(s: str, limit: int) -> str:
+        """Potong di batas kata (bukan tengah kata), tambah … kalau kepotong."""
+        s = re.sub(r'\s+', ' ', s).strip()
+        if len(s) <= limit:
+            return s
+        cut = s[:limit]
+        sp = cut.rfind(' ')
+        if sp > limit * 0.6:        # ada spasi yg masuk akal → potong di situ
+            cut = cut[:sp]
+        return cut.rstrip() + " …"
+
+    PER_MSG = 600        # batas per pesan (naik dari 140)
+    TOTAL = 3000         # batas total biar aman dari limit Telegram (4096)
+    lines, used = [], 0
     for role, txt in msgs:
-        icon = "👤" if role == "user" else "🤖"
-        snippet = re.sub(r'\s+', ' ', txt)[:140]
-        if len(txt) > 140:
-            snippet += "…"
-        lines.append(f"{icon} {snippet}")
-    return "\n".join(lines)
+        who = "👤 *Kamu:*" if role == "user" else "🤖 *Claude:*"
+        body = _clip(txt, PER_MSG)
+        block = f"{who}\n{body}"
+        if used + len(block) > TOTAL:
+            lines.append("…_(lebih lama dipotong — Claude tetap ingat semua)_")
+            break
+        lines.append(block)
+        used += len(block)
+    return "\n\n".join(lines)
 
 def _cc_sessions(workdir: str) -> list[dict]:
     """List Claude Code sessions for a workdir, sorted by time.
@@ -2976,26 +3811,25 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
                 f"Kelola: `/provider add|edit|del|info|test|models|reload`")
     if c == "/cost":
         # Konteks per window (ukuran ASLI termasuk cache) — penunjuk read-only.
+        # Compaction otomatis ditangani NATIVE Claude Code.
         store = _load_store(cid)
         ctx_lines = []
         for name, w in store.get("windows", {}).items():
             ct = w.get("ctx_tokens", 0)
             if not ct:
                 continue
-            thr = _compact_threshold(w.get("model", MODEL_SLOT))
-            if thr:
-                bar = "🟢" if ct < thr * 0.7 else ("🟡" if ct < thr else "🔴")
-                cap = f" /{thr//1000}k"
-            else:
-                bar, cap = "⚪", ""
-            mark = " ⚠️auto-compact" if w.get("needs_compact") else ""
-            ctx_lines.append(f"• **{name}** (`{w.get('model', MODEL_SLOT)}`): {bar} ~{ct//1000}k{cap} token{mark}")
+            mdl = w.get("model", MODEL_SLOT)
+            lim_real = w.get("ctx_limit")   # window asli dari CLI (kalau pernah kebaca)
+            lim = lim_real or CONTEXT_WINDOWS.get(mdl, CONTEXT_WINDOWS.get("opus", 1_000_000))
+            pct = ct / lim if lim else 0
+            bar = "🟢" if pct < 0.6 else ("🟡" if pct < 0.85 else "🔴")
+            mark = "" if lim_real else "~"   # '~' = perkiraan statis, tanpa '~' = asli
+            ctx_lines.append(f"• **{name}** (`{mdl}`): {bar} {ct//1000}k /{mark}{lim//1000}k token")
         out = []
         if ctx_lines:
-            ratio = f"{int(AUTO_COMPACT_RATIO*100)}%" if AUTO_COMPACT_RATIO else "off"
-            out.append(f"🧮 **Konteks aktif** (auto-compact @ {ratio} limit)")
+            out.append("🧮 **Konteks aktif** (auto-compact native saat mendekati limit)")
             out += ctx_lines
-            out.append("_Manual: /compact (ringkas) atau /new (reset)._")
+            out.append("_Mulai bersih: /new._")
             out.append("")
         if not _usage_log:
             out.append("💰 Belum ada pemakaian tercatat sesi ini.")
@@ -3098,19 +3932,20 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
         return (f"📢 Verbose progress: *{'ON' if cur else 'OFF'}*\n"
                 f"{'Semua step (teks + thinking) tampil live.' if cur else 'Cuma tool penting yang tampil.'}")
     if c in ("/agents", "/tasks"):
-        # Tampilkan window/task yang lagi jalan
-        running = [w for (ci, w) in _busy if ci == cid]
-        store = _load_store(cid)
-        lines = ["🤖 *Status agent/task*\n"]
-        wins = store.get("windows", {})
-        if not wins:
-            return "Belum ada window aktif."
-        for name in wins:
-            mark = "🟢 KERJA" if name in running else "⚪ idle"
-            lines.append(f"• **{name}** — {mark}")
-        active_slots = MAX_CONCURRENT - _claude_slots._value
-        lines.append(f"\n⚙️ Slot global: {active_slots}/{MAX_CONCURRENT} dipakai")
-        return "\n".join(lines)
+        # Agent View interaktif: tiap window/sesi jadi tombol yang bisa di-tap
+        # untuk PINDAH ke sana (padanan panah atas/bawah di terminal Claude).
+        thread_id = (msg or {}).get("message_thread_id", 0)
+        kw = {"chat_id": cid, "text": _to_md(_agentview_text(cid)),
+              "parse_mode": "MarkdownV2", "reply_markup": _agentview_kb(cid)}
+        if thread_id:
+            kw["message_thread_id"] = thread_id
+        try:
+            tg_api("sendMessage", **kw)
+        except Exception:
+            kw["text"] = re.sub(r'\\([_*\[\]()~`>#+\-=|{}.!\\])', r'\1', kw["text"])[:4096]
+            kw.pop("parse_mode", None)
+            tg_api("sendMessage", **kw)
+        return None
     if c == "/restart":
         send_msg(cid, "♻️ Merestart bot… (auto-up via systemd, ~5 detik)")
         log("Restart requested via /restart")
@@ -3158,22 +3993,21 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
         threading.Thread(target=_process_safe, args=(synth,), daemon=True).start()
         return f"↻ Mengulang: _{last[:60]}_"
     if c in ("/queue", "/q"):
+        store = _load_store(cid)
+        win_name = store.get("active", "main")
+        win = win_switch(cid, win_name)
         if not a.strip():
-            sess = load_sess(cid)
-            q = sess.get("queue", [])
+            q = win.get("queue", [])
             if not q:
                 return "📭 Antrian kosong. Pakai: `/queue <prompt>`"
             lines = ["📋 *Antrian:*"]
             for i, item in enumerate(q, 1):
                 lines.append(f"{i}. _{item[:50]}_")
             return "\n".join(lines)
-        store = _load_store(cid)
-        win_name = store.get("active", "main")
         lock_key = (cid, win_name)
         prompt = a.strip()
         if lock_key in _busy:
-            sess = load_sess(cid)
-            q = sess.setdefault("queue", [])
+            q = win.setdefault("queue", [])
             q.append(prompt)
             save_sess(cid)
             return f"➕ Diantri (posisi {len(q)}). Jalan setelah task sekarang selesai."
@@ -3211,23 +4045,71 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
         threading.Thread(target=_run_bg, daemon=True).start()
         return f"🌙 Jalan di background (window `{bg_name}`). Hasil dikirim begitu selesai."
     if c in ("/compact", "/compress"):
-        # Native /compact (manual): kirim "/compact" ke sesi → Claude Code ringkas
-        # in-place & persist. Pintar, histori inti tetap, session_id sama.
+        # /compact MANUAL = jalankan slash command NATIVE Claude Code via
+        # `-p "/compact" --resume <sid>` (BUKAN reseed lama yg bikin loop — itu
+        # sudah dicabut). Terbukti 2026-07-02: headless compact nulis marker
+        # isCompactSummary ke file sesi & memori percakapan tetap nyambung.
+        # Auto-compact native tetap jalan sendiri; ini cuma buat trigger manual.
         store = _load_store(cid)
         win_name = store.get("active", "main")
         if (cid, win_name) in _busy:
-            return "⏳ Window ini masih kerja. /stop dulu sebelum /compact."
+            return "⏳ Window ini masih kerja. Tunggu selesai (atau /stop) sebelum /compact."
+        sess = load_sess(cid)
+        sid = sess.get("session_id", "")
+        wd = sess.get("workdir", WORKDIR)
+        if not sid or not _session_exists(wd, sid):
+            return "ℹ️ Sesi window ini masih kosong — belum ada yang bisa di-compact. (/new buat mulai bersih)"
+        old_k = int(sess.get("ctx_tokens", 0)) // 1000
+        lock_key = (cid, win_name)
 
-        def _do_compact():
-            send_msg(cid, "🗜️ Meringkas konteks & menyegarkan sesi… sebentar.")
-            ok, info = _reseed_compact(cid, win_name)
-            if ok:
-                send_msg(cid, "✅ *Konteks diringkas & sesi disegarkan.* Mulai bersih dari "
-                              "ringkasan inti — token balik hemat. Lanjut ngobrol biasa.")
-            else:
-                send_msg(cid, f"↩️ Belum dipangkas: {info}")
-        threading.Thread(target=_do_compact, daemon=True).start()
-        return None
+        def _count_compact_markers() -> int:
+            try:
+                proj = _cc_project_dir(wd)
+                f = proj / f"{sid}.jsonl" if proj else None
+                if not f or not f.is_file():
+                    return -1
+                n = 0
+                with open(f, errors="replace") as fh:
+                    for ln in fh:
+                        if '"isCompactSummary":true' in ln or '"isCompactSummary": true' in ln:
+                            n += 1
+                return n
+            except Exception:
+                return -1
+
+        def _run_compact():
+            _busy.add(lock_key)
+            t0 = time.time()
+            try:
+                before = _count_compact_markers()
+                run_claude("/compact", cid, wd, sid,
+                           provider=sess.get("provider"), model=sess.get("model"),
+                           lock_key=lock_key)
+                if lock_key in _cancelled:
+                    _cancelled.discard(lock_key)
+                    txt = "⏹ Compact dibatalkan."
+                elif before >= 0 and _count_compact_markers() > before:
+                    # Marker BARU muncul → compact beneran kejadian, bukan asumsi.
+                    sess["ctx_tokens"] = 0      # ukuran baru kebaca di pesan berikutnya
+                    save_sess(cid)
+                    was = f" (tadinya ~{old_k}k)" if old_k else ""
+                    txt = (f"🧹 Compact selesai · {int(time.time()-t0)}s. Sesi diringkas "
+                           f"native{was} — ukuran baru muncul di footer pesan berikutnya.")
+                else:
+                    txt = ("⚠️ Compact jalan tapi marker ringkasan tidak nambah — "
+                           "kemungkinan sesi masih terlalu kecil buat diringkas. Cek /cost.")
+            except Exception as e:
+                txt = f"⚠️ Compact gagal: {e}"
+            finally:
+                _busy.discard(lock_key)
+            try:
+                tg_api("sendMessage", chat_id=cid, text=txt, parse_mode="")
+            except Exception:
+                pass
+        threading.Thread(target=_run_compact, daemon=True).start()
+        return ("🧹 Compact native jalan… CLI lagi meringkas sesi (~10–60s "
+                "tergantung ukuran). Kukabari begitu selesai — window ini "
+                "kekunci dulu biar gak tabrakan.")
     if c == "/undo":
         # Mundurkan N turn user terakhir dari file sesi (destruktif tapi aman:
         # backup + truncate suffix linked-list). Default N=1.
@@ -3264,6 +4146,11 @@ class LiveStream:
     _BASE_INTERVAL = 0.5      # cadence edit dasar (detik) — rapat tapi aman 429
     _MAX_INTERVAL = 8.0       # cap adaptive-backoff saat flood
     _FLOOD_STRIKES = 3        # gagal edit beruntun sebelum mundur
+    _HEARTBEAT = 0.7          # detak hidup: edit walau TANPA event baru (mis. di
+                              # dalam Agent/subagent yg diam) → spinner+timer jalan.
+                              # 0.7dtk = muter lebih cepat, masih aman (backoff
+                              # adaptif mundur sendiri kalau Telegram mulai flood).
+    _SPINNER = "🌑🌒🌓🌔🌕🌖🌗🌘"  # bulan muter — jelas & kebaca di HP
     _TG_LIMIT = 4096
     _LIVE_BUDGET = 3600       # jaga bubble live di bawah limit (sisakan header)
     _SPLIT = 3500             # ukuran potong jawaban final (raw; sisakan utk escaping)
@@ -3277,6 +4164,8 @@ class LiveStream:
         self.text = ""           # jawaban asisten yang tumbuh
         self.think = ""          # thinking yang tumbuh (verbose)
         self.note_line = ""      # status transient (mis. antri slot)
+        self._spin = 0           # indeks frame spinner (muter tiap heartbeat)
+        self._agents = {}        # id → (desc, start_ts) subagent yg SEDANG kerja
         self._lock = threading.Lock()
         self._dirty = False
         self._last_sent = None
@@ -3286,31 +4175,64 @@ class LiveStream:
         self._stop = threading.Event()
         self._thread = None
         self._typing_thread = None
-        # Bubble streaming = teks MURNI tanpa reply_markup (edit ringan, anti
-        # flood-freeze). Tombol Stop ada di reply keyboard (bar bawah) — lihat
-        # REPLY_KB. /stop (slash) tetap jalan sebagai alternatif.
-        st = tg_api("sendMessage", chat_id=cid,
-                    text=f"🔄 {win_name} · {provider}/{model}\n⏳ memulai…",
-                    parse_mode="",
-                    **({"message_thread_id": thread_id} if thread_id else {}))
-        self.st_id = (st or {}).get("result", {}).get("message_id", 0)
+        # Mode Hermes v2 (hasil reverse-eng gateway Hermes): teks diketik LIVE
+        # ke pesan per-SEGMEN (kirim ≥24 char, edit berkala + kursor ▉, disegel
+        # rich MarkdownV2 di batas tool/akhir); tool numpuk di SATU bubble
+        # per batch yg di-edit nambah baris.
+        self.hermes = HERMES_MODE
+        self.reply_mid = 0            # message_id prompt user → quote header
+        self._outq = queue.Queue()    # antrian kirim progresif (urutan terjaga)
+        self._sender = None
+        self._drained = False
+        self._seg_id = None           # message_id segmen teks yg lagi diketik
+        self._seg_ver = 0             # versi segmen (gugurkan edit basi pas seal)
+        self._seg_shown = None        # teks preview terakhir yg beneran tampil
+        self._seg_last = 0.0          # ts edit segmen terakhir
+        self._last_seal = None        # teks segel terakhir (dedup vs result)
+        # Mode Hermes: TANPA bubble spinner sama sekali (permintaan user) —
+        # chat murni isi pesan Claude; liveness dari "typing…" + narasi/kartu
+        # real-time. Bonus: nol edit bubble = nol rebutan jatah kirim.
+        if self.hermes:
+            self.st_id = 0
+        else:
+            # Bubble streaming = teks MURNI tanpa reply_markup (edit ringan, anti
+            # flood-freeze). Tombol Stop ada di reply keyboard (bar bawah) — lihat
+            # REPLY_KB. /stop (slash) tetap jalan sebagai alternatif.
+            st = tg_api("sendMessage", chat_id=cid,
+                        text=f"🔄 {win_name} · {provider}/{model}\n⏳ memulai…",
+                        parse_mode="",
+                        **({"message_thread_id": thread_id} if thread_id else {}))
+            self.st_id = (st or {}).get("result", {}).get("message_id", 0)
 
     # ---- rendering (live = plain text) ----
     def _header(self):
-        return (f"🔄 {self.win} · {self.provider}/{self.model} · "
+        # Spinner + timer di HEADER (atas). Sengaja TIDAK di ujung teks: kalau
+        # nempel di badan teks, render streaming yg dipotong (…ekor) bisa nyangkut
+        # jadi jawaban akhir & teks keliatan kepotong. Di header = badan teks aman.
+        spin = self._SPINNER[self._spin % len(self._SPINNER)]
+        return (f"{spin} {self.win} · {self.provider}/{self.model} · "
                 f"⏱ {int(time.time()-self.started)}s")
 
     def _render(self):
         lines = [self._header()]
         if self.note_line:
             lines += ["", self.note_line]
-        if self.feed:
+        if self.feed and not self.hermes:   # hermes: tool tampil sbg kartu pesan
             lines += [""] + self.feed[-8:]
+        # Tanda subagent SEDANG kerja (bisa lama & diam) — di zona status, bukan
+        # di badan teks jawaban, jadi tak pernah motong teks. Spinner + timer per
+        # agent = bukti Claude masih aktif lewat Agent.
+        if self._agents:
+            spin = self._SPINNER[self._spin % len(self._SPINNER)]
+            now = time.time()
+            for desc, ts in list(self._agents.values()):
+                d = desc or "kerja"
+                lines += ["", f"{spin} 🤖 Agent: {d} · ⏱ {int(now-ts)}s"]
         if self.verbose and self.think:
             tp = " ".join(self.think.split())
             if tp:
                 lines += ["", f"💭 {tp[-200:]}"]
-        if self.text:
+        if self.text and not self.hermes:   # hermes: narasi terkirim real-time
             body = self.text
             budget = self._LIVE_BUDGET - len("\n".join(lines)) - 4
             budget = max(budget, 200)
@@ -3335,11 +4257,42 @@ class LiveStream:
             return
         if t == "assistant":
             for b in ev.get("message", {}).get("content", []):
-                if isinstance(b, dict) and b.get("type") == "tool_use":
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "text" and self.hermes:
+                    # Turn text KOMPLIT → SEGEL segmen live-nya: preview yg
+                    # lagi diketik di-upgrade jadi MarkdownV2 rapi (tanpa
+                    # kursor) & dikunci. Swap state di bawah lock supaya
+                    # flusher segmen berhenti nyentuh pesan yg disegel.
+                    txt = (b.get("text") or "").strip()
+                    if txt:
+                        with self._lock:
+                            sid = self._seg_id
+                            self._seg_id = None
+                            self._seg_ver += 1
+                            self._seg_shown = None
+                            self.text = ""
+                        self._enqueue("seal", (sid, txt))
+                if b.get("type") == "tool_use":
+                    if self.hermes:
+                        self._enqueue("tool", _tool_line(b.get("name"),
+                                                         b.get("input", {})))
                     self._push(_tool_label(b.get("name"), b.get("input", {})))
+                    # Task/subagent → tandai SEDANG kerja (bisa lama & diam).
+                    if (b.get("name") or "").lower() == "task":
+                        desc = (b.get("input", {}) or {}).get("description", "")[:40]
+                        with self._lock:
+                            self._agents[b.get("id")] = (desc, time.time())
+                            self._dirty = True
         elif t == "user":
             for b in ev.get("message", {}).get("content", []):
                 if isinstance(b, dict) and b.get("type") == "tool_result":
+                    # Subagent selesai → lepas tanda "sedang kerja".
+                    tuid = b.get("tool_use_id")
+                    if tuid in self._agents:
+                        with self._lock:
+                            self._agents.pop(tuid, None)
+                            self._dirty = True
                     mark = "⚠️ error" if b.get("is_error") else "✅"
                     self._push(f"   ↳ {mark} {self._preview(b.get('content',''))}".rstrip())
 
@@ -3363,17 +4316,222 @@ class LiveStream:
         return (s[:n] + "…") if len(s) > n else s
 
     def note(self, text):
+        if self.hermes:
+            # Tanpa bubble: status transient (mis. antri slot) tetap harus
+            # keliatan → kirim sbg pesan kecil sekali (dedup teks sama).
+            if text and text != self.note_line:
+                self.note_line = text
+                self._enqueue("msg", text)
+            return
         with self._lock:
             self.note_line = text
             self._dirty = True
         self._flush(force=True)
 
+    # ---- Hermes v2: segmen live-typed (reverse-eng gateway Hermes) ----
+    _CURSOR = " ▉"            # kursor ngetik (persis Hermes)
+    _SEG_MIN = 24             # ambang char kirim pertama (persis Hermes)
+    _SEG_IVAL = 1.0           # cadence edit segmen (Hermes 0.8; bucket kita 1.05)
+
+    @staticmethod
+    def _strip_pick_live(t: str) -> str:
+        """Preview live dipotong di tag PICK/MULTIPICK — tag mentah jangan
+        pernah tampil ke user; blok pilihan dirender caller via tombol."""
+        up = (t or "").upper()
+        cuts = [i for i in (up.find("[[PICK"), up.find("[[MULTIPICK")) if i >= 0]
+        return t[:min(cuts)] if cuts else t
+
+    def _seg_loop(self):
+        while not self._stop.is_set():
+            try:
+                self._seg_tick()
+            except Exception:
+                pass
+            self._stop.wait(0.15)
+
+    def _seg_tick(self):
+        with self._lock:
+            buf = self._strip_pick_live(self.text or "").strip()
+            sid, ver = self._seg_id, self._seg_ver
+        if len(buf) < self._SEG_MIN:
+            return
+        if time.time() - self._seg_last < self._SEG_IVAL:
+            return
+        show = buf if len(buf) <= 3400 else "…" + buf[-3400:]
+        if show == self._seg_shown:
+            return
+        if sid is None:
+            kw = {"chat_id": self.cid, "text": show + self._CURSOR, "parse_mode": "",
+                  # keburu di-seal/stop saat masih ngantri gerbang → batal total
+                  "_abort": lambda: self._stop.is_set() or self._seg_ver != ver}
+            if self.thread_id:
+                kw["message_thread_id"] = self.thread_id
+            if self.reply_mid:
+                kw["reply_to_message_id"] = self.reply_mid
+            d = tg_api("sendMessage", **kw)
+            new_id = (d or {}).get("result", {}).get("message_id")
+            self._seg_last = time.time()
+            if new_id:
+                stray = False
+                with self._lock:
+                    if self._seg_ver == ver:
+                        self._seg_id = new_id
+                        self._seg_shown = show
+                    else:
+                        stray = True   # keburu di-seal saat send in-flight
+                if stray:
+                    log(f"hermes: preview basi (mid={new_id}) dihapus — seal duluan")
+                    try:
+                        tg_api("deleteMessage", chat_id=self.cid, message_id=new_id)
+                    except Exception:
+                        pass
+        else:
+            d = tg_api("editMessageText", chat_id=self.cid, message_id=sid,
+                       text=show + self._CURSOR, parse_mode="",
+                       _abort=lambda: self._stop.is_set() or self._seg_ver != ver)
+            self._seg_last = time.time()
+            if (d or {}).get("ok"):
+                self._seg_shown = show
+
+    def _seal_rich(self, sid, txt):
+        """Segel segmen: pesan preview di-upgrade jadi MarkdownV2 rapi tanpa
+        kursor (persis finalize=True Hermes). Kepanjangan → chunk pertama
+        nge-edit preview, sisanya pesan lanjutan."""
+        chunks = _smart_chunks(txt, hard_limit=self._SPLIT) or [txt]
+        first, ok = chunks[0], False
+        if sid:
+            try:
+                md = _to_md(first)
+            except Exception:
+                md = None
+            if md is not None and len(md) <= self._TG_LIMIT:
+                try:
+                    d = tg_api("editMessageText", chat_id=self.cid, message_id=sid,
+                               text=md, parse_mode="MarkdownV2")
+                    ok = bool(d.get("ok"))
+                except Exception:
+                    ok = False
+            if not ok:
+                try:
+                    d = tg_api("editMessageText", chat_id=self.cid, message_id=sid,
+                               text=first[:self._TG_LIMIT], parse_mode="")
+                    ok = bool(d.get("ok"))
+                except Exception:
+                    ok = False
+        if not ok:
+            if sid:
+                # Edit gagal total → preview (plain + kursor) jangan jadi
+                # bangkai dobel di chat: hapus dulu, baru kirim versi rich.
+                log(f"hermes: seal edit gagal (mid={sid}) — preview dihapus, kirim fresh")
+                try:
+                    tg_api("deleteMessage", chat_id=self.cid, message_id=sid)
+                except Exception:
+                    pass
+            # Segmen pendek yg belum sempat punya preview (atau edit gagal)
+            _send_raw(self.cid, _to_md(first), self.reply_mid, self.thread_id)
+        for ch in chunks[1:]:
+            _send_raw(self.cid, _to_md(ch), 0, self.thread_id)
+
+    def _enqueue(self, kind, payload):
+        if payload is not None:
+            self._outq.put((kind, payload))
+
+    def _sender_loop(self):
+        # Kirim dari antrian satu-satu (bucket anti-429 yg macu tempo). Dipisah
+        # dari reader supaya parsing event gak ke-block jatah Telegram.
+        # Bubble tool GRUP (persis Hermes): baris2 tool numpuk di satu pesan
+        # yg di-edit; ditutup tiap narasi muncul → tool berikutnya buka
+        # bubble baru di bawahnya. Header '💻 terminal' di-dedup.
+        tb_id, tb_lines, last_bash = None, [], False
+
+        def _tb_text():
+            return "\n".join(tb_lines)[:3900]
+
+        while True:
+            item = self._outq.get()
+            if item is None:
+                self._outq.task_done()
+                break
+            kind, payload = item
+            try:
+                if kind == "tool":
+                    tkind, ttxt = payload
+                    if not ttxt:
+                        self._outq.task_done()
+                        continue
+                    if tkind == "bash":
+                        blk = ("" if last_bash else "💻 terminal\n") + f"```\n{ttxt}\n```"
+                        last_bash = True
+                    else:
+                        blk = ttxt
+                        last_bash = False
+                    if tb_id is None or len(_tb_text()) + len(blk) > 3800:
+                        tb_lines, tb_id = [blk], None
+                        kw = {"chat_id": self.cid, "text": _to_md(_tb_text()),
+                              "parse_mode": "MarkdownV2"}
+                        if self.thread_id:
+                            kw["message_thread_id"] = self.thread_id
+                        d = tg_api("sendMessage", **kw)
+                        tb_id = (d or {}).get("result", {}).get("message_id")
+                    else:
+                        tb_lines.append(blk)
+                        d = tg_api("editMessageText", chat_id=self.cid,
+                                   message_id=tb_id, text=_to_md(_tb_text()),
+                                   parse_mode="MarkdownV2")
+                        if not (d or {}).get("ok"):
+                            tb_id = None   # edit mati → batch berikut pesan baru
+                elif kind == "seal":
+                    tb_id, tb_lines, last_bash = None, [], False   # tutup batch tool
+                    sid, txt = payload
+                    if _PICK_RE.search(txt) or _MULTIPICK_RE.search(txt):
+                        # Blok pilihan dirender caller (tombol). Preview yg
+                        # sempat tampil dihapus biar gak dobel sama pesan tombol.
+                        if sid:
+                            try:
+                                tg_api("deleteMessage", chat_id=self.cid, message_id=sid)
+                            except Exception:
+                                pass
+                    else:
+                        self._seal_rich(sid, txt)
+                    self._last_seal = txt
+                elif kind == "msg":
+                    tb_id, tb_lines, last_bash = None, [], False
+                    _send_raw(self.cid, _to_md(payload), 0, self.thread_id)
+            except Exception:
+                pass
+            self._outq.task_done()
+
     # ---- flusher thread (adaptive throttle) ----
     def start(self):
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        if self.hermes:
+            # Flusher segmen: ngetik live ke pesan per-segmen (kursor ▉).
+            self._thread = threading.Thread(target=self._seg_loop, daemon=True)
+            self._thread.start()
+            self._sender = threading.Thread(target=self._sender_loop, daemon=True)
+            self._sender.start()
+        else:
+            # Flusher bubble status (mode lama).
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
         self._typing_thread = threading.Thread(target=self._typing_loop, daemon=True)
         self._typing_thread.start()
+
+    def _age_interval(self):
+        # Makin TUA task, makin jarang edit bubble. Edit 2x/detik selama 5 menit
+        # ke pesan yg sama itu pemicu badai 429 (bukti log 2026-07-02 11:42–11:54)
+        # — penalti Telegram numpuk sampai kiriman jawaban ikut mati. Awal task
+        # tetap rapat biar responsif; di menit-menit panjang, update pelan
+        # nggak kerasa bedanya tapi jatah rate Telegram aman.
+        age = time.time() - self.started
+        if age < 45:
+            return self._BASE_INTERVAL
+        if age < 120:
+            return 2.0
+        if age < 240:
+            return 3.5
+        if age < 420:
+            return 5.0
+        return 7.0
 
     def _loop(self):
         # Flush loop: HANYA edit bubble (ringan). typing() dipindah ke thread
@@ -3384,7 +4542,24 @@ class LiveStream:
             # nampilin teks/feed (masih "memulai…"), flush SEGERA tanpa nunggu
             # interval → token pertama langsung muncul (mirip terminal).
             first = self._last_sent is None and self._dirty
-            if first or time.time() - self._last_edit >= self._interval:
+            # Hermes: pesan asli (narasi/kartu) yg lagi ngalir = bukti hidup.
+            # Spinner NGALAH — jangan rebutan jatah kirim sama pesan beneran.
+            if self.hermes and not first and self._outq.unfinished_tasks:
+                self._stop.wait(0.15)
+                continue
+            iv = max(self._interval, self._age_interval())
+            if self.hermes:
+                iv = max(iv, 3.0)   # bubble tinggal heartbeat — 3s cukup hidup
+            # Heartbeat: walau TANPA event baru (mis. lagi di dalam Agent yg diam,
+            # atau Claude mikir lama), tetap maju-in spinner + timer biar bubble
+            # kelihatan HIDUP — anti "keliatan mati padahal jalan". Saat flood-
+            # backoff (interval naik), heartbeat ikut mundur biar nggak picu 429.
+            beat = time.time() - self._last_edit >= max(self._HEARTBEAT, iv)
+            if beat:
+                with self._lock:
+                    self._spin += 1
+                    self._dirty = True
+            if first or beat or time.time() - self._last_edit >= iv:
                 self._flush()
             self._stop.wait(0.15)
 
@@ -3398,6 +4573,11 @@ class LiveStream:
     def _flush(self, force=False):
         if not self.st_id:
             return
+        # Kalau sudah di-stop (finalize mau ambil alih bubble), JANGAN nulis lagi —
+        # cegah render streaming (kepotong + spinner) nimpa jawaban final. Kecuali
+        # force=True (dipakai note() sebelum stop).
+        if self._stop.is_set() and not force:
+            return
         with self._lock:
             if not self._dirty and not force:
                 return
@@ -3405,10 +4585,18 @@ class LiveStream:
             txt = self._render()
         if txt == self._last_sent:
             return
-        ok = True
+        # Cek d.get("ok") EKSPLISIT — tg_api bisa nyerah stlh 429 retry exhaust
+        # & balikin {} tanpa raise, jadi try/except doang gak kedeteksi (backoff
+        # gak pernah aktif pas kondisi paling parah, malah makin ngebom TG).
+        ok = False
         try:
-            tg_api("editMessageText", chat_id=self.cid, message_id=self.st_id,
-                   text=txt, parse_mode="")
+            # _abort: kalau stream keburu di-stop saat edit ini masih ngantri
+            # gerbang / kena penalti 429, edit BASI dibatalkan — jangan sampai
+            # nimpa kartu status yg ditulis finalize.
+            d = tg_api("editMessageText", chat_id=self.cid, message_id=self.st_id,
+                       text=txt, parse_mode="",
+                       _abort=(None if force else self._stop.is_set))
+            ok = bool(d.get("ok"))
         except Exception:
             ok = False
         self._last_edit = time.time()
@@ -3423,19 +4611,47 @@ class LiveStream:
 
     def stop(self):
         self._stop.set()
+        # Tunggu thread flusher benar-benar mati sebelum lanjut, supaya edit
+        # streaming terakhir (yg kepotong + spinner) TIDAK jalan setelah/berbarengan
+        # dgn finalize → jawaban final dijamin jadi tulisan terakhir di bubble.
+        t = self._thread
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=1)
+        # Mode Hermes: kuras antrian narasi/kartu SAMPAI habis dulu — jawaban
+        # final (finalize) wajib muncul SETELAH semua pesan progresif.
+        if self._sender and not self._drained:
+            self._drained = True
+            self._outq.put(None)
+            deadline = time.time() + 120
+            while self._outq.unfinished_tasks and time.time() < deadline:
+                time.sleep(0.2)
 
     # ---- finalize: bubble → jawaban (markdown, multi-msg, PICK passthrough) ----
     def _footer(self, usage):
         dur = int(time.time() - self.started)
-        ctx_k = int((usage or {}).get("context", 0)) // 1000
-        limit_k = (CONTEXT_WINDOWS.get(self.model,
-                   CONTEXT_WINDOWS.get("opus", 1_000_000))) // 1000
-        turns = (usage or {}).get("turns", 0)
-        extra = f" · 📊 {ctx_k}k/{limit_k}k" + (f" · {turns} turn" if turns else "")
-        return f"✅ {dur}s · {self.provider}/{self.model}{extra}"
+        u = usage or {}
+        ctx = int(u.get("context", 0))
+        # Limit ASLI dari CLI (modelUsage.contextWindow); fallback ke tebakan
+        # statis CONTEXT_WINDOWS cuma kalau CLI gak lapor — dan itu DITANDAI
+        # '~' biar kelihatan jujur mana angka asli mana perkiraan.
+        real = int(u.get("ctx_limit", 0) or 0)
+        limit = real or CONTEXT_WINDOWS.get(
+            self.model, CONTEXT_WINDOWS.get("opus", 1_000_000))
+        approx = "" if real else "~"
+        pct = f" ({ctx * 100 // limit}%)" if ctx and limit else ""
+        turns = u.get("turns", 0)
+        extra = (f" · 📊 {ctx // 1000}k/{approx}{limit // 1000}k{pct}"
+                 + (f" · {turns} turn" if turns else ""))
+        return f"✅ selesai · {dur}s · {self.provider}/{self.model}{extra}"
 
-    def _edit_md(self, text):
-        """Edit bubble dgn MarkdownV2; kalau gagal parse / kepanjangan → plain."""
+    def _edit_md(self, text, kb=None):
+        """Edit bubble dgn MarkdownV2; kalau gagal parse / kepanjangan → plain.
+        Return True HANYA kalau Telegram BENERAN konfirmasi sukses (ok=true) —
+        bukan cuma "tidak exception". tg_api bisa diam2 nyerah stlh 429 retry
+        exhaust & balikin {} TANPA raise, jadi try/except doang bikin caller
+        (finalize) ngira sukses padahal bubble gagal total ditulis.
+        kb (opsional): inline keyboard nempel di hasil edit (mis. tombol ✂️)."""
+        extra = {"reply_markup": kb} if kb else {}
         md = None
         try:
             md = _to_md(text)
@@ -3443,15 +4659,16 @@ class LiveStream:
             md = None
         if md is not None and len(md) <= self._TG_LIMIT:
             try:
-                tg_api("editMessageText", chat_id=self.cid, message_id=self.st_id,
-                       text=md, parse_mode="MarkdownV2")
-                return True
+                d = tg_api("editMessageText", chat_id=self.cid, message_id=self.st_id,
+                           text=md, parse_mode="MarkdownV2", **extra)
+                if d.get("ok"):
+                    return True
             except Exception:
                 pass
         try:
-            tg_api("editMessageText", chat_id=self.cid, message_id=self.st_id,
-                   text=text[:self._TG_LIMIT], parse_mode="")
-            return True
+            d = tg_api("editMessageText", chat_id=self.cid, message_id=self.st_id,
+                       text=text[:self._TG_LIMIT], parse_mode="", **extra)
+            return bool(d.get("ok"))
         except Exception:
             return False
 
@@ -3459,22 +4676,70 @@ class LiveStream:
         self.stop()
         footer = self._footer(usage)
         # PICK/MULTIPICK → caller render tombol; bubble dikecilkan jadi footer.
+        # Kalau edit footer gagal (rate-limit berat), fallback pesan baru — biar
+        # gak nyangkut jadi teks streaming lama selamanya (kosmetik tapi bingungin).
         if _PICK_RE.search(result or "") or _MULTIPICK_RE.search(result or ""):
-            if self.st_id:
-                self._edit_md(footer)
+            if self.st_id and not self._edit_md(footer):
+                _send_raw(self.cid, _to_md(footer), 0, self.thread_id)
             return False
         body = (result or "").strip() or "_(kosong)_"
-        chunks = _split_chunks(body, self._SPLIT)
-        first = chunks[0]
-        if len(chunks) == 1:
-            first = first + "\n\n———\n" + footer
+        # Hermes v2: jawaban final = turn text terakhir yg SUDAH disegel rich
+        # oleh sender (live-typed → seal). stop() di atas sudah menguras
+        # antrian, jadi _last_seal final. Kalau sama → jangan kirim ulang.
+        already = (self.hermes and self._last_seal
+                   and " ".join(body.split()) == " ".join(self._last_seal.split()))
+        try:
+            # Tabel (pipe/box) → fence monospace SEBELUM chunking, biar jadi
+            # pesan sendiri: kolom sejajar + tap-to-copy tabel utuh.
+            body = _boxify_tables(body)
+        except Exception:
+            pass
+        chunks = [] if already else _smart_chunks(body, hard_limit=self._SPLIT)
+        # Desain anti-terpotong: bubble TIDAK pernah di-edit jadi jawaban.
+        # Bubble menyusut jadi kartu status (edit kecil — kalaupun gagal cuma
+        # kosmetik), jawaban SELALU pesan baru: sendMessage jauh lebih andal
+        # daripada edit besar in-place yg rawan 429 pas task lama/berat.
+        # Jawaban panjang → kartu status bawa tombol "✂️ Pecah buat copy":
+        # di-tap → jawaban dikirim ulang per paragraf kecil, jadi long-press →
+        # Copy dapet persis bagian yg diincar (gak perlu copy semuanya).
+        footer_kb = None
+        if len(body) > 500:
+            sp_tok = uuid.uuid4().hex[:8]
+            _pending_split[sp_tok] = body
+            _cap_pending(_pending_split, 30)
+            footer_kb = {"inline_keyboard": [[
+                {"text": "✂️ Pecah buat copy", "callback_data": f"split:{sp_tok}"}]]}
+        footer_ok = False
         if self.st_id:
-            self._edit_md(first)                       # bubble → jawaban (in place)
-        else:
-            _send_raw(self.cid, _to_md(first), reply_to, self.thread_id)
-        for i, ch in enumerate(chunks[1:], start=1):   # lanjutan → pesan baru
-            piece = ch + ("\n\n———\n" + footer if i == len(chunks) - 1 else "")
-            _send_raw(self.cid, _to_md(piece), 0, self.thread_id)
+            footer_ok = self._edit_md(footer, kb=footer_kb)
+            if not footer_ok:
+                log(f"finalize: edit bubble→status gagal (cid={self.cid}, "
+                    f"st_id={self.st_id}) — footer nempel di pesan terakhir")
+        for i, ch in enumerate(chunks):
+            piece = ch
+            if i == len(chunks) - 1 and not footer_ok and self.st_id:
+                piece = piece + "\n\n———\n" + footer
+            # Tempo antar-chunk diurus token-bucket gerbang (burst 3 → sisanya
+            # ~1/detik) — gak perlu sleep manual lagi, kerasa lebih gesit.
+            _send_raw(self.cid, _to_md(piece), reply_to if i == 0 else 0,
+                      self.thread_id)
+        if not self.st_id:
+            # Mode Hermes (tanpa bubble): kartu status ✅ + tombol ✂️ jadi
+            # pesan PENUTUP sendiri — penanda selesai + info durasi/context.
+            kw = {"chat_id": self.cid, "text": _to_md(footer),
+                  "parse_mode": "MarkdownV2"}
+            if footer_kb:
+                kw["reply_markup"] = footer_kb
+            if self.thread_id:
+                kw["message_thread_id"] = self.thread_id
+            try:
+                d = tg_api("sendMessage", **kw)
+                if not d.get("ok"):
+                    kw["text"] = footer
+                    kw.pop("parse_mode", None)
+                    tg_api("sendMessage", **kw)
+            except Exception:
+                pass
         return True
 
     def abort(self, msg=None):
@@ -3547,28 +4812,85 @@ def process(upd: dict):
         log(f"BLOCKED uid={uid}")
         return
 
-    # Photo / document → download to workdir, let Claude Code analyze it (#4)
+    # Photo / document → download to workdir, niru drag-drop terminal (#4).
+    # Album (banyak foto) di-buffer dulu lewat media_group_id biar 1 run, bukan
+    # nge-trigger Claude berkali-kali.
     file_id, file_name = None, None
     if msg.get("photo"):
         file_id = msg["photo"][-1]["file_id"]  # largest size
         file_name = f"tg_photo_{mid}.jpg"
     elif msg.get("document"):
         d = msg["document"]
+        if d.get("file_size", 0) > TG_FILE_LIMIT:
+            send_msg(cid, "❌ File >20MB — di luar batas Telegram Bot API. "
+                          "Kompres dulu atau kirim lewat cara lain.",
+                     thread_id=thread_id)
+            return
         file_id = d["file_id"]
         file_name = d.get("file_name", f"tg_file_{mid}")
     if file_id:
         caption = (msg.get("caption", "") or "").strip()
         if is_group and "@" in caption:
             caption = re.sub(r'@\w+\s*', '', caption).strip()
+        mgid = msg.get("media_group_id")
+        akey = (cid, mgid) if mgid else None
+        # Album: DAFTAR item SEBELUM download (download bisa lama & bikin album
+        # pecah kalau didaftar setelahnya). Non-album: langsung download.
+        if akey:
+            _album_note(akey, {"cid": cid, "uid": uid, "mid": mid,
+                               "thread_id": thread_id, "chat_type": chat_type})
         saved = _download_tg_file(cid, file_id, file_name)
-        if saved:
-            text = (caption or "Tolong lihat/analisa file ini.") + f"\n\n(File terlampir: {saved})"
-        else:
+        _ensure_uploads_gitignore(load_sess(cid).get("workdir", WORKDIR))
+        if akey:
+            if not saved:
+                log(f"album item download GAGAL (cid={cid}, {file_name})")
+            _album_deposit(akey, saved or "", caption)   # tetap setor (path bisa kosong)
+            return
+        if not saved:
             send_msg(cid, "❌ Gagal download file.", thread_id=thread_id)
             return
+        text = _attach_prompt(caption, [saved])
 
     # Pending rename: next text message becomes the new session title
     # Add-provider wizard: collect answers step by step
+    # Cron wizard: collect typed answers (time/date/prompt/editprompt)
+    if cid in _pending_cron:
+        ans = text.strip()
+        st = _pending_cron[cid]
+        if ans.lower() in ("/batal", "/cancel", "batal"):
+            _pending_cron.pop(cid, None)
+            send_msg(cid, "↩️ Wizard cron dibatalkan.")
+            return
+        step = st.get("step")
+        if step == "editprompt":
+            jid = st.get("jid")
+            _pending_cron.pop(cid, None)
+            if _job_update(jid, prompt=ans, title=ans[:40]):
+                j = _job_by_id(jid)
+                send_msg(cid, "✅ Tugas jadwal diperbarui.")
+                tg_api("sendMessage", chat_id=cid, text=_to_md(_cron_job_text(j)),
+                       parse_mode="MarkdownV2", reply_markup=_cron_job_kb(j))
+            else:
+                send_msg(cid, "❌ Jadwal tak ditemukan.")
+            return
+        if step == "prompt":
+            if not ans:
+                send_msg(cid, "❌ Tugas kosong. Ketik tugasnya, atau /batal.")
+                return
+            st["data"]["prompt"] = ans
+            ok, res = _cron_finalize(cid)
+            if not ok:
+                send_msg(cid, f"❌ Gagal: {res}")
+                return
+            nr = _fmt_when(_next_run(res))
+            send_msg(cid, f"✅ *Jadwal dibuat!*\n\n{_sched_label(res)}\n"
+                          f"⏭ Berikutnya: *{nr}*\n`{res['prompt'][:60]}`")
+            tg_api("sendMessage", chat_id=cid, text=_to_md(_cron_panel_text(cid)),
+                   parse_mode="MarkdownV2", reply_markup=_cron_panel_kb(cid))
+            return
+        # step tak dikenal → reset aman
+        _pending_cron.pop(cid, None)
+
     if cid in _pending_provider:
         ans = text.strip()
         if ans.lower() in ("/batal", "/cancel", "batal"):
@@ -3696,6 +5018,10 @@ def process(upd: dict):
                text=_to_md(f"🎯 *Effort level* (aktif: `{cur}`)\nMakin tinggi = mikir lebih dalam, lebih lama/mahal."),
                parse_mode="MarkdownV2", reply_markup=EFFORT_KB)
         return
+    if text == "_CRONKB_":
+        tg_api("sendMessage", chat_id=cid, text=_to_md(_cron_panel_text(cid)),
+               parse_mode="MarkdownV2", reply_markup=_cron_panel_kb(cid))
+        return
 
     # Handle commands
     if text.startswith("/"):
@@ -3775,8 +5101,16 @@ def process(upd: dict):
             _running_procs.pop(lock_key, None)
             _cancelled.discard(lock_key)
         else:
+            # Window lagi kerja → JANGAN tolak. Antrikan otomatis (seperti
+            # terminal Claude Code: ketik pesan berikutnya, dikerjakan setelah
+            # yang sekarang selesai). Drain-nya di akhir _handle (win["queue"]).
+            q = win.setdefault("queue", [])
+            q.append(text)
+            save_sess(cid)
             tg_api("sendMessage", chat_id=cid,
-                   text=f"⏳ Window '{win_name}' masih kerja… kirim /stop untuk paksa berhenti.",
+                   text=f"➕ Diantri (posisi {len(q)}) — dikerjakan setelah task "
+                        f"sekarang selesai. /stop untuk batalkan yang jalan, "
+                        f"/queue lihat antrian.",
                    parse_mode="", **({"message_thread_id": thread_id} if thread_id else {}))
             return
 
@@ -3785,37 +5119,9 @@ def process(upd: dict):
     _busy.add(lock_key)
     _cancelled.discard(lock_key)
 
-    # Auto-compact (RESEED): kalau turn sebelumnya konteksnya nyentuh ambang,
-    # ringkas sesi & pindah ke session_id baru yang bersih DULU sebelum proses
-    # pesan ini. Ganti auto-compact loop interaktif yang nggak ada di mode -p.
-    # Guard `AUTO_COMPACT_RATIO`: kalau auto-compact dimatikan (ratio=0), flag
-    # `needs_compact` sisa dari session lama TIDAK boleh nge-trigger. Manual
-    # `/compact` tetap jalan (jalur lain).
-    if AUTO_COMPACT_RATIO and win.get("needs_compact"):
-        try:
-            tg_api("sendMessage", chat_id=cid,
-                   text="🗜️ Konteks mendekati limit — meringkas & menyegarkan sesi dulu (sekali, biar hemat)…",
-                   parse_mode="", **({"message_thread_id": thread_id} if thread_id else {}))
-        except Exception:
-            pass
-        ok, info = _reseed_compact(cid, win_name)
-        win = win_switch(cid, win_name)  # reload state (sid baru + pending_seed)
-        try:
-            tg_api("sendMessage", chat_id=cid,
-                   text=("✅ Konteks diringkas & sesi disegarkan. Lanjut normal."
-                         if ok else f"↩️ Gagal menyegarkan ({info}); lanjut dgn sesi lama."),
-                   parse_mode="", **({"message_thread_id": thread_id} if thread_id else {}))
-        except Exception:
-            pass
-
-    # Reseed seed-injection: kalau ada ringkasan dari compact (auto/manual),
-    # sisipkan ke pesan ini sebagai konteks awal sesi baru, lalu hapus (sekali pakai).
-    _seed = win.get("pending_seed")
-    if _seed:
-        text = ("[Ringkasan konteks dari sesi sebelumnya — lanjutkan dari sini]\n\n"
-                + _seed + "\n\n———\n\n" + text)
-        win.pop("pending_seed", None)
-        save_sess(cid)
+    # (RESEED dicabut 2026-07-01) Compaction kini 100% NATIVE Claude Code:
+    # otomatis, client-side, jalan di mode -p — tak ada lagi trigger RESEED,
+    # seed-injection, atau needs_compact di sini.
 
     wd = win["workdir"]
     sid = win["session_id"]
@@ -3828,6 +5134,7 @@ def process(upd: dict):
     started = time.time()
     ls = LiveStream(cid, thread_id, win_name, win_provider, win_model,
                     win_verbose, lock_key, started)
+    ls.reply_mid = mid   # narasi Hermes nge-quote prompt user (header konteks)
     ls.start()
 
     # Acquire a global slot (RAM guard). If none free, tell the user we're
@@ -3848,20 +5155,13 @@ def process(upd: dict):
                                    effort=win_effort, on_event=ls.on_event)
         ls.stop()
 
-        # Record context size + arm auto-compact for the NEXT turn if over ambang.
+        # Catat ukuran konteks (cuma buat tampilan /status). Compaction sendiri
+        # diurus NATIVE Claude Code — bot tak lagi nge-arm apa pun.
         ctx = (usage or {}).get("context", 0)
         if ctx:
             win["ctx_tokens"] = ctx
-            thr = _compact_threshold(win_model)
-            if thr and ctx > thr and not win.get("needs_compact"):
-                win["needs_compact"] = True
-                try:
-                    tg_api("sendMessage", chat_id=cid,
-                           text=f"📊 Konteks ~{ctx//1000}k token (≥{int(AUTO_COMPACT_RATIO*100)}% "
-                                f"limit {win_model}). Auto-compact sebelum pesan berikut.",
-                           parse_mode="", **({"message_thread_id": thread_id} if thread_id else {}))
-                except Exception:
-                    pass
+            if (usage or {}).get("ctx_limit"):
+                win["ctx_limit"] = usage["ctx_limit"]   # window asli dari CLI
             save_sess(cid)
 
         # Finalize: single growing bubble → jawaban final (multi-msg + PICK).
@@ -3905,97 +5205,607 @@ def process(upd: dict):
         except Exception as e:
             log(f"queue drain error: {e}")
 
-# ── Cron / scheduled tasks (#9) ───────────────────────────────────────────────
+# ── Cron / scheduled tasks (grade produksi) ──────────────────────────────────
+# Jadwal otomatis: jalanin prompt ke Claude pada waktu tertentu. Semua waktu WIB
+# (server = Asia/Jakarta). 4 tipe: daily / weekly / interval / once.
+# Schema job: {
+#   id, cid, thread_id, title, prompt, workdir, provider, model,
+#   type: "daily"|"weekly"|"interval"|"once",
+#   time: "HH:MM"            (daily/weekly/once)
+#   days: [0..6]             (weekly; 0=Senin..6=Minggu)
+#   interval_h: int          (interval; tiap N jam)
+#   date: "YYYY-MM-DD"       (once)
+#   enabled: bool, last_run: iso, run_count: int, created: iso,
+#   anchor: iso              (interval; titik mulai hitung)
+# }
 CRON_FILE = BOT_DIR / "cron.json"
+_DOW = ["Sen", "Sel", "Rab", "Kam", "Jum", "Sab", "Min"]
+_DOW_FULL = ["Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu", "Minggu"]
 
 def _load_cron() -> list:
     try:
-        return json.loads(CRON_FILE.read_text())
+        jobs = json.loads(CRON_FILE.read_text())
     except Exception:
         return []
+    # Migrasi job lama (cuma punya time+prompt+last_run "YYYY-MM-DD") → schema baru.
+    changed = False
+    for j in jobs:
+        if "id" not in j:
+            j["id"] = uuid.uuid4().hex[:8]; changed = True
+        if "type" not in j:
+            j["type"] = "daily"; changed = True
+        j.setdefault("title", "")
+        j.setdefault("enabled", True)
+        j.setdefault("run_count", 0)
+        j.setdefault("thread_id", 0)
+        j.setdefault("created", "")
+        j.setdefault("target_win", "cron")  # window tujuan; "cron"=terpisah (lama)
+        # last_run lama formatnya "YYYY-MM-DD" (tanggal). Biarkan — _due nanganin.
+    if changed:
+        _save_cron(jobs)
+    return jobs
 
 def _save_cron(jobs: list):
     CRON_FILE.write_text(json.dumps(jobs, ensure_ascii=False, indent=2))
 
+def _my_jobs(cid: int) -> list:
+    return [j for j in _load_cron() if j.get("cid") == cid]
+
+def _job_by_id(jid: str):
+    for j in _load_cron():
+        if j.get("id") == jid:
+            return j
+    return None
+
+def _job_update(jid: str, **fields) -> bool:
+    jobs = _load_cron()
+    for j in jobs:
+        if j.get("id") == jid:
+            j.update(fields); _save_cron(jobs); return True
+    return False
+
+def _job_delete(jid: str) -> bool:
+    jobs = _load_cron()
+    n = len(jobs)
+    jobs = [j for j in jobs if j.get("id") != jid]
+    if len(jobs) != n:
+        _save_cron(jobs); return True
+    return False
+
+def _next_run(j: dict, now: datetime = None) -> datetime | None:
+    """Hitung kapan job jalan BERIKUTNYA (WIB). None kalau habis (once lewat)."""
+    now = now or datetime.now()
+    t = j.get("type", "daily")
+    if t == "interval":
+        ih = max(1, int(j.get("interval_h", 24)))
+        try:
+            anchor = datetime.fromisoformat(j["anchor"]) if j.get("anchor") else now
+        except Exception:
+            anchor = now
+        if j.get("last_run"):
+            try:
+                base = datetime.fromisoformat(j["last_run"])
+            except Exception:
+                base = anchor
+        else:
+            base = anchor - timedelta(hours=ih)  # biar jalan pertama dekat anchor
+        nxt = base + timedelta(hours=ih)
+        while nxt < now:
+            nxt += timedelta(hours=ih)
+        return nxt
+    # tipe berbasis jam HH:MM
+    try:
+        hh, mm = map(int, j.get("time", "07:00").split(":"))
+    except Exception:
+        hh, mm = 7, 0
+    if t == "once":
+        try:
+            d = datetime.strptime(j.get("date", ""), "%Y-%m-%d").date()
+        except Exception:
+            return None
+        cand = datetime(d.year, d.month, d.day, hh, mm)
+        return cand if cand >= now else None
+    if t == "weekly":
+        days = sorted(set(j.get("days", [])))
+        if not days:
+            return None
+        for add in range(0, 8):
+            cand = (now + timedelta(days=add)).replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if cand.weekday() in days and cand >= now:
+                return cand
+        return None
+    # daily
+    cand = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if cand < now:
+        cand += timedelta(days=1)
+    return cand
+
+def _sched_label(j: dict) -> str:
+    """Deskripsi jadwal yang enak dibaca."""
+    t = j.get("type", "daily")
+    tm = j.get("time", "07:00")
+    if t == "daily":
+        return f"tiap hari {tm} WIB"
+    if t == "weekly":
+        ds = "/".join(_DOW[d] for d in sorted(set(j.get("days", []))))
+        return f"tiap {ds} {tm} WIB"
+    if t == "interval":
+        return f"tiap {j.get('interval_h', 24)} jam"
+    if t == "once":
+        return f"sekali · {j.get('date','?')} {tm} WIB"
+    return t
+
+def _fmt_when(dt: datetime | None) -> str:
+    if not dt:
+        return "—"
+    now = datetime.now()
+    delta = dt - now
+    secs = int(delta.total_seconds())
+    if secs < 0:
+        return "segera"
+    if secs < 3600:
+        rel = f"{secs//60}m lagi"
+    elif secs < 86400:
+        rel = f"{secs//3600}j {(secs%3600)//60}m lagi"
+    else:
+        rel = f"{secs//86400}h lagi"
+    if dt.date() == now.date():
+        return f"hari ini {dt:%H:%M} ({rel})"
+    if dt.date() == (now + timedelta(days=1)).date():
+        return f"besok {dt:%H:%M} ({rel})"
+    return f"{dt:%a %d/%m %H:%M} ({rel})"
+
+def _due(j: dict, now: datetime) -> bool:
+    """True kalau job HARUS jalan pada menit `now` ini & belum jalan utk slot itu."""
+    if not j.get("enabled", True):
+        return False
+    t = j.get("type", "daily")
+    today = now.strftime("%Y-%m-%d")
+    hm = now.strftime("%H:%M")
+    if t == "interval":
+        nr = _next_run(j, now)
+        return bool(nr and nr <= now)
+    if j.get("time") != hm:
+        return False
+    # match menit; cegah dobel pakai last_run
+    lr = j.get("last_run", "")
+    if t == "daily":
+        return lr[:10] != today
+    if t == "weekly":
+        return now.weekday() in set(j.get("days", [])) and lr[:10] != today
+    if t == "once":
+        return j.get("date") == today and not lr
+    return False
+
+def _run_cron_job(j: dict):
+    """Eksekusi satu job.
+    - target_win == "session" → NYAMBUNG ke sesi pilihan (resume target_sid):
+      jalanin prompt dgn --resume session itu → jawaban NAMBAH ke riwayat sesi
+      tsb (lanjut percakapan). Anti-tabrakan: kalau ada window yg lagi kerja
+      pakai session_id sama → ANTRI di window itu, bukan ditimpa.
+    - target_win == "cron"    → window terpisah (isolated, tak ganggu sesi lain).
+    - target_win == <nama>    → legacy: nyambung ke window bernama (pipeline)."""
+    cid = j["cid"]
+    thread_id = j.get("thread_id", 0) or 0
+    target = j.get("target_win", "cron")
+    label = j.get("title") or j.get("prompt", "")[:40]
+
+    # ── Mode NYAMBUNG ke SESI pilihan (resume session_id) ────────────────────
+    if target == "session" and j.get("target_sid"):
+        sid = j["target_sid"]
+        wd = j.get("workdir", WORKDIR)
+        prov = j.get("provider", PROVIDER)
+        mdl = j.get("model", MODEL_SLOT)
+        prompt = f"[Tugas terjadwal · {label}]\n\n" + j["prompt"]
+        store = _load_store(cid)
+        # Kalau ADA window yg lagi busy & session_id-nya == sid → antri di situ
+        for wname, w in store.get("windows", {}).items():
+            if w.get("session_id") == sid and (cid, wname) in _busy:
+                w.setdefault("queue", []).append(prompt)
+                _save_store(cid)
+                tg_api("sendMessage", chat_id=cid, parse_mode="",
+                       text=f"⏰ Jadwal '{label}' diantri (sesi lagi dipakai). "
+                            f"Jalan begitu selesai.")
+                return
+        tk = {"message_thread_id": thread_id} if thread_id else {}
+        try:
+            tg_api("sendMessage", chat_id=cid, parse_mode="",
+                   text=f"⏰ Menjalankan jadwal di sesi «{j.get('target_title','?')}»: {label}…", **tk)
+            result, _u = run_claude(prompt, cid, wd, sid, provider=prov, model=mdl)
+            send_msg(cid, f"⏰ *Hasil jadwal — {label}*\n\n{result}", thread_id=thread_id)
+        except Exception as e:
+            log(f"cron job {j.get('id')} (session) error: {e}")
+            try:
+                tg_api("sendMessage", chat_id=cid, parse_mode="",
+                       text=f"⚠️ Jadwal '{label}' gagal: {str(e)[:120]}", **tk)
+            except Exception:
+                pass
+        return
+
+    # ── Mode NYAMBUNG ke window bernama (legacy) ─────────────────────────────
+    if target and target not in ("cron", "session"):
+        store = _load_store(cid)
+        if target not in store.get("windows", {}):
+            tg_api("sendMessage", chat_id=cid, parse_mode="",
+                   text=f"⚠️ Jadwal '{label}': window `{target}` tak ada lagi → jalan terpisah.")
+            target = "cron"
+        else:
+            lock_key = (cid, target)
+            prompt = (f"[Tugas terjadwal · {label}]\n\n" + j["prompt"])
+            if lock_key in _busy:
+                w = store["windows"][target]
+                w.setdefault("queue", []).append(prompt)
+                _save_store(cid)
+                tg_api("sendMessage", chat_id=cid, parse_mode="",
+                       text=f"⏰ Jadwal '{label}' diantri di sesi `{target}` "
+                            f"(lagi kerja). Jalan begitu selesai.")
+                return
+            cur_active = store.get("active", "main")
+            win_switch(cid, target)
+            tg_api("sendMessage", chat_id=cid, parse_mode="",
+                   text=f"⏰ Menjalankan jadwal di sesi `{target}`: {label}…")
+            synth = {"message": {"chat": {"id": cid, "type": "private"},
+                                 "from": {"id": cid},
+                                 "message_id": 0, "text": prompt}}
+            try:
+                _process_safe(synth)
+            finally:
+                try:
+                    st2 = _load_store(cid)
+                    busy_wins = [k for (ci, k) in _busy if ci == cid]
+                    if target not in busy_wins and cur_active in st2.get("windows", {}):
+                        st2["active"] = cur_active
+                        _save_store(cid)
+                except Exception:
+                    pass
+            return
+
+    # ── Mode TERPISAH (cron) ─────────────────────────────────────────────────
+    win = win_switch(cid, "cron")
+    win["workdir"] = j.get("workdir", WORKDIR)
+    win["provider"] = j.get("provider", PROVIDER)
+    win["model"] = j.get("model", MODEL_SLOT)
+    save_sess(cid)
+    tk = {"message_thread_id": thread_id} if thread_id else {}
+    try:
+        tg_api("sendMessage", chat_id=cid, parse_mode="",
+               text=f"⏰ Menjalankan jadwal: {label}…", **tk)
+        result, _u = run_claude(j["prompt"], cid, win["workdir"],
+                                win["session_id"], provider=win["provider"],
+                                model=win["model"])
+        send_msg(cid, f"⏰ *Hasil jadwal — {label}*\n\n{result}", thread_id=thread_id)
+        save_sess(cid)
+    except Exception as e:
+        log(f"cron job {j.get('id')} error: {e}")
+        try:
+            tg_api("sendMessage", chat_id=cid, parse_mode="",
+                   text=f"⚠️ Jadwal '{label}' gagal: {str(e)[:120]}", **tk)
+        except Exception:
+            pass
+
 def _cron_command(cid: int, a: str) -> str:
+    """Shortcut teks (panel utama via tombol). /cron, /cron add HH:MM <tugas>."""
     jobs = _load_cron()
     parts = a.split(maxsplit=1)
     sub = parts[0].lower() if parts else "list"
     if sub == "add" and len(parts) > 1:
-        # /cron add HH:MM <prompt>
         rest = parts[1].split(maxsplit=1)
         if len(rest) < 2 or ":" not in rest[0]:
-            return "Format: `/cron add 07:00 cek server lapor ke aku`"
+            return "Format: `/cron add 07:00 cek server lapor ke aku`\n(atau pakai tombol ⏰ Cron untuk wizard lengkap)"
         tm, prompt = rest[0], rest[1]
         try:
-            hh, mm = map(int, tm.split(":"))
-            assert 0 <= hh < 24 and 0 <= mm < 60
+            hh, mm = map(int, tm.split(":")); assert 0 <= hh < 24 and 0 <= mm < 60
         except Exception:
             return "❌ Jam tidak valid. Format HH:MM (mis. 07:00)"
         sess = load_sess(cid)
-        jobs.append({"cid": cid, "time": f"{hh:02d}:{mm:02d}", "prompt": prompt,
-                     "workdir": sess["workdir"], "provider": sess.get("provider", PROVIDER),
-                     "model": sess.get("model", MODEL_SLOT), "last_run": ""})
+        jobs.append({"id": uuid.uuid4().hex[:8], "cid": cid, "thread_id": 0,
+                     "type": "daily", "time": f"{hh:02d}:{mm:02d}", "prompt": prompt,
+                     "title": prompt[:40], "workdir": sess["workdir"],
+                     "provider": sess.get("provider", PROVIDER),
+                     "model": sess.get("model", MODEL_SLOT),
+                     "enabled": True, "last_run": "", "run_count": 0,
+                     "created": datetime.now().isoformat(timespec="seconds")})
         _save_cron(jobs)
-        return f"⏰ Jadwal ditambah: tiap hari **{hh:02d}:{mm:02d} WIB**\n`{prompt[:60]}`"
+        return f"⏰ Jadwal ditambah: *tiap hari {hh:02d}:{mm:02d} WIB*\n`{prompt[:60]}`"
     if sub in ("del", "delete", "rm") and len(parts) > 1:
         try:
             idx = int(parts[1]) - 1
         except Exception:
             return "Format: `/cron del <nomor>`"
-        mine = [j for j in jobs if j["cid"] == cid]
+        mine = _my_jobs(cid)
         if 0 <= idx < len(mine):
-            jobs.remove(mine[idx])
-            _save_cron(jobs)
+            _job_delete(mine[idx]["id"])
             return f"🗑️ Jadwal #{idx+1} dihapus."
         return "❌ Nomor tidak ada."
-    # list
-    mine = [j for j in jobs if j["cid"] == cid]
+    # list (teks ringkas)
+    mine = _my_jobs(cid)
     if not mine:
-        return ("⏰ **Cron / Jadwal** (waktu WIB)\n\nBelum ada jadwal.\n\n"
-                "Tambah: `/cron add 07:00 cek server lapor ke aku`\n"
-                "Hapus: `/cron del 1`\n\n"
-                "_Jam pakai WIB (Asia/Jakarta). Jalan tiap hari di jam itu._")
-    lines = ["⏰ **Jadwal Aktif** (WIB)\n"]
+        return ("⏰ *Cron / Jadwal* (WIB)\n\nBelum ada jadwal.\n\n"
+                "Pakai tombol *⏰ Cron* di menu untuk wizard lengkap, atau cepat:\n"
+                "`/cron add 07:00 cek server lapor ke aku`")
+    lines = ["⏰ *Jadwal Aktif* (WIB)\n"]
     for i, j in enumerate(mine, 1):
-        lines.append(f"{i}. **{j['time']} WIB** — `{j['prompt'][:50]}`")
-    lines.append("\nTambah: `/cron add HH:MM <prompt>` · Hapus: `/cron del <n>`")
+        st = "🟢" if j.get("enabled", True) else "⏸"
+        nr = _fmt_when(_next_run(j)) if j.get("enabled", True) else "pause"
+        lines.append(f"{i}. {st} *{_sched_label(j)}* — `{(j.get('title') or j.get('prompt',''))[:40]}`\n     ↳ berikut: {nr}")
+    lines.append("\n_Kelola lengkap (edit/pause/run) lewat tombol ⏰ Cron._")
     return "\n".join(lines)
 
 def _cron_loop():
-    """Background: run scheduled jobs when their time matches (once per day)."""
-    import threading
+    """Background: jalanin job yang due. Cek tiap 30 detik."""
     while True:
         try:
-            now = time.strftime("%H:%M")
-            today = time.strftime("%Y-%m-%d")
+            now = datetime.now()
             jobs = _load_cron()
             changed = False
             for j in jobs:
-                if j.get("time") == now and j.get("last_run") != today:
-                    j["last_run"] = today
-                    changed = True
-                    cid = j["cid"]
-                    win = win_switch(cid, "cron")
-                    win["workdir"] = j.get("workdir", WORKDIR)
-                    win["provider"] = j.get("provider", PROVIDER)
-                    win["model"] = j.get("model", MODEL_SLOT)
-                    save_sess(cid)
-                    try:
-                        tg_api("sendMessage", chat_id=cid,
-                               text=f"⏰ Menjalankan jadwal {j['time']}…", parse_mode="")
-                        result, _u = run_claude(j["prompt"], cid, win["workdir"],
-                                                win["session_id"], provider=win["provider"],
-                                                model=win["model"])
-                        send_msg(cid, f"⏰ *Hasil jadwal {j['time']}*\n\n{result}")
-                        save_sess(cid)
-                    except Exception as e:
-                        log(f"cron job error: {e}")
+                try:
+                    if _due(j, now):
+                        j["last_run"] = now.isoformat(timespec="seconds")
+                        j["run_count"] = j.get("run_count", 0) + 1
+                        if j.get("type") == "once":
+                            j["enabled"] = False  # sekali jalan → matikan
+                        changed = True
+                        threading.Thread(target=_run_cron_job, args=(dict(j),), daemon=True).start()
+                except Exception as e:
+                    log(f"cron eval {j.get('id')} error: {e}")
             if changed:
                 _save_cron(jobs)
         except Exception as e:
             log(f"cron loop error: {e}")
         time.sleep(30)
+
+
+# ── Cron UI: panel + wizard + manajemen per-job ──────────────────────────────
+def _cron_panel_kb(cid: int) -> dict:
+    """Keyboard panel utama: daftar job (tiap baris 1 job) + tombol tambah."""
+    rows = []
+    for j in _my_jobs(cid):
+        st = "🟢" if j.get("enabled", True) else "⏸"
+        lbl = (j.get("title") or j.get("prompt", ""))[:24]
+        rows.append([{"text": f"{st} {_sched_label(j)} · {lbl}",
+                      "callback_data": f"cronview:{j['id']}"}])
+    rows.append([{"text": "➕ Tambah Jadwal", "callback_data": "cron_add"}])
+    rows.append([{"text": "🔄 Refresh", "callback_data": "cron_panel"},
+                 {"text": "✖️ Tutup", "callback_data": "m_close"}])
+    return {"inline_keyboard": rows}
+
+def _cron_panel_text(cid: int) -> str:
+    mine = _my_jobs(cid)
+    if not mine:
+        return ("⏰ *Cron / Jadwal Otomatis* (WIB)\n\n"
+                "Belum ada jadwal. Tekan *➕ Tambah Jadwal* untuk bikin tugas "
+                "yang dijalankan Claude otomatis di waktu tertentu.\n\n"
+                "_Contoh: tiap pagi 07:00 cek server & lapor, atau tiap Senin "
+                "ringkas progress minggu lalu._")
+    active = sum(1 for j in mine if j.get("enabled", True))
+    nexts = [(_next_run(j), j) for j in mine if j.get("enabled", True)]
+    nexts = [(d, j) for d, j in nexts if d]
+    head = [f"⏰ *Cron / Jadwal Otomatis* (WIB)",
+            f"_{len(mine)} jadwal · {active} aktif_"]
+    if nexts:
+        d, j = min(nexts, key=lambda x: x[0])
+        head.append(f"⏭ Berikutnya: *{_fmt_when(d)}* — `{(j.get('title') or j.get('prompt',''))[:30]}`")
+    head.append("\nPilih jadwal untuk kelola, atau tambah baru 👇")
+    return "\n".join(head)
+
+def _cron_job_text(j: dict) -> str:
+    st = "🟢 Aktif" if j.get("enabled", True) else "⏸ Pause"
+    nr = _fmt_when(_next_run(j)) if j.get("enabled", True) else "—"
+    last = j.get("last_run", "") or "belum pernah"
+    if last and last != "belum pernah":
+        last = last.replace("T", " ")[:16] + " WIB"
+    tw = j.get("target_win", "cron")
+    if tw == "session":
+        sess_lbl = f"💬 «{j.get('target_title','?')}» (nyambung)"
+    elif tw == "cron":
+        sess_lbl = "🔒 terpisah (cron)"
+    else:
+        sess_lbl = f"🪟 {tw} (nyambung konteks)"
+    lines = [
+        f"⏰ *Detail Jadwal*",
+        f"Status: {st}",
+        f"Jadwal: *{_sched_label(j)}*",
+        f"Berikutnya: {nr}",
+        f"Terakhir jalan: {last}  ·  sudah {j.get('run_count', 0)}×",
+        f"Sesi: {sess_lbl}",
+        f"Provider/Model: `{j.get('provider','?')}/{j.get('model','?')}`",
+        f"Folder: `{j.get('workdir','?')}`",
+    ]
+    if j.get("thread_id"):
+        lines.append(f"Output ke topic: `{j['thread_id']}`")
+    lines.append(f"\n*Tugas:*\n{j.get('prompt','')[:500]}")
+    return "\n".join(lines)
+
+def _cron_job_kb(j: dict) -> dict:
+    toggle = ("⏸ Pause", "cronpause") if j.get("enabled", True) else ("▶️ Aktifkan", "cronresume")
+    return {"inline_keyboard": [
+        [{"text": "🚀 Jalankan Sekarang", "callback_data": f"cronrun:{j['id']}"}],
+        [{"text": toggle[0], "callback_data": f"{toggle[1]}:{j['id']}"},
+         {"text": "✏️ Edit Tugas", "callback_data": f"croneditprompt:{j['id']}"}],
+        [{"text": "🗑️ Hapus", "callback_data": f"crondel:{j['id']}"}],
+        [{"text": "← Daftar", "callback_data": "cron_panel"},
+         {"text": "✖️ Tutup", "callback_data": "m_close"}],
+    ]}
+
+# ---- wizard tambah jadwal ----
+_CRON_TYPE_KB = {"inline_keyboard": [
+    [{"text": "🔁 Harian", "callback_data": "crontype:daily"},
+     {"text": "📅 Mingguan", "callback_data": "crontype:weekly"}],
+    [{"text": "⏱ Tiap N jam", "callback_data": "crontype:interval"},
+     {"text": "1️⃣ Sekali", "callback_data": "crontype:once"}],
+    [{"text": "✖️ Batal", "callback_data": "cron_cancel"}],
+]}
+_CRON_INTERVAL_KB = {"inline_keyboard": [
+    [{"text": "1 jam", "callback_data": "cronival:1"},
+     {"text": "3 jam", "callback_data": "cronival:3"},
+     {"text": "6 jam", "callback_data": "cronival:6"}],
+    [{"text": "12 jam", "callback_data": "cronival:12"},
+     {"text": "24 jam", "callback_data": "cronival:24"}],
+    [{"text": "✖️ Batal", "callback_data": "cron_cancel"}],
+]}
+
+def _cron_days_kb(sel: list) -> dict:
+    rows, row = [], []
+    for i, d in enumerate(_DOW):
+        mark = "✅" if i in sel else "▫️"
+        row.append({"text": f"{mark}{d}", "callback_data": f"cronday:{i}"})
+        if len(row) == 4:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "✔️ Lanjut", "callback_data": "cronday_done"},
+                 {"text": "✖️ Batal", "callback_data": "cron_cancel"}])
+    return {"inline_keyboard": rows}
+
+def _cron_hour_kb() -> dict:
+    """Grid jam 00–23 (6 per baris), tinggal klik."""
+    rows, row = [], []
+    for h in range(24):
+        row.append({"text": f"{h:02d}", "callback_data": f"cronhh:{h}"})
+        if len(row) == 6:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "✖️ Batal", "callback_data": "cron_cancel"}])
+    return {"inline_keyboard": rows}
+
+def _cron_min_kb(hh: int) -> dict:
+    """Pilihan menit (kelipatan 5) + tombol :00/:30 cepat."""
+    rows, row = [], []
+    for m in range(0, 60, 5):
+        row.append({"text": f"{hh:02d}:{m:02d}", "callback_data": f"cronmm:{m}"})
+        if len(row) == 4:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "← Ganti jam", "callback_data": "cronhh_back"},
+                 {"text": "✖️ Batal", "callback_data": "cron_cancel"}])
+    return {"inline_keyboard": rows}
+
+def _cron_date_kb() -> dict:
+    """14 hari ke depan sebagai tombol (Hari ini / Besok / Sen 03/07 …)."""
+    now = datetime.now()
+    rows, row = [], []
+    for i in range(14):
+        d = now + timedelta(days=i)
+        if i == 0:
+            lbl = "Hari ini"
+        elif i == 1:
+            lbl = "Besok"
+        else:
+            lbl = f"{_DOW[d.weekday()]} {d:%d/%m}"
+        row.append({"text": lbl, "callback_data": f"crondate:{d:%Y-%m-%d}"})
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([{"text": "✖️ Batal", "callback_data": "cron_cancel"}])
+    return {"inline_keyboard": rows}
+
+def _cron_win_kb(cid: int) -> dict:
+    """Pilih SESI tujuan: daftar sesi /resume dari folder aktif (pakai judul) +
+    opsi 'Terpisah'. Callback cronsid:<idx> (idx ke _sess_cache biar pendek)."""
+    sess = load_sess(cid)
+    sessions = _cc_sessions(sess["workdir"])
+    _sess_cache[cid] = sessions  # dipakai callback lookup by index
+    cur = sess.get("session_id", "")
+    rows = []
+    for i, s in enumerate(sessions[:12]):
+        star = "⭐ " if s["id"] == cur else ""
+        lbl = (s.get("title") or s.get("summary") or s["id"][:8]).strip()[:30]
+        rows.append([{"text": f"{star}💬 {lbl}", "callback_data": f"cronsid:{i}"}])
+    rows.append([{"text": "🔒 Sesi terpisah (default)", "callback_data": "cronsid:sep"}])
+    rows.append([{"text": "✖️ Batal", "callback_data": "cron_cancel"}])
+    return {"inline_keyboard": rows}
+
+def _cron_ask_win(cid: int, mid: int):
+    """Step pilih SESI tujuan — sesudah jadwal-waktu, sebelum prompt."""
+    sess = load_sess(cid)
+    sessions = _cc_sessions(sess["workdir"])
+    if not sessions:
+        # Belum ada sesi di folder ini → langsung terpisah, skip step
+        st = _pending_cron.get(cid)
+        if st:
+            st["data"]["target_win"] = "cron"
+            st["step"] = "prompt"
+        _cron_ask_prompt(cid, mid)
+        return
+    edit_md(cid, mid,
+            "➕ *Tambah Jadwal* — Sesi Tujuan\n\n"
+            "Jadwal ini nyambung ke *sesi mana*?\n\n"
+            "💬 *Pilih sesi* (dari /resume) → cron lanjut percakapan itu, Claude "
+            "ingat konteksnya & jawabannya nambah ke sesi tsb. Kalau sesi lagi "
+            "dipakai, jadwal *diantri* aman.\n"
+            "🔒 *Sesi terpisah* → window khusus cron, tak ganggu sesi lain "
+            "(tugas harus mandiri).",
+            reply_markup=_cron_win_kb(cid))
+
+def _cron_start_wizard(cid: int, mid: int):
+    _pending_cron[cid] = {"step": "type", "data": {}}
+    edit_md(cid, mid,
+            "➕ *Tambah Jadwal* (1/4)\n\nPilih *jenis* jadwal:\n\n"
+            "🔁 Harian — tiap hari jam tertentu\n"
+            "📅 Mingguan — pilih hari (bisa banyak)\n"
+            "⏱ Tiap N jam — interval berulang\n"
+            "1️⃣ Sekali — satu tanggal & jam, lalu nonaktif",
+            reply_markup=_CRON_TYPE_KB)
+
+def _cron_ask_time(cid: int, mid: int, extra: str = ""):
+    """Step jam: pilih JAM dulu (grid), lalu menit."""
+    edit_md(cid, mid,
+            f"➕ *Tambah Jadwal* — Jam (WIB){extra}\n\nPilih *jam*:",
+            reply_markup=_cron_hour_kb())
+
+def _cron_ask_date(cid: int, mid: int):
+    edit_md(cid, mid,
+            "➕ *Tambah Jadwal* — Tanggal\n\nPilih *tanggal* (klik):",
+            reply_markup=_cron_date_kb())
+
+def _cron_ask_prompt(cid: int, mid: int):
+    edit_md(cid, mid,
+            "➕ *Tambah Jadwal* (3/3)\n\nKetik *tugas* yang harus dikerjakan Claude.\n"
+            "Tulis sejelas mungkin — ini dikirim sebagai prompt.\n\n"
+            "_Contoh: \"Cek status systemd cc-tg, kalau mati restart & lapor. "
+            "Ringkas 1 paragraf.\"_",
+            reply_markup={"inline_keyboard": [[{"text": "✖️ Batal", "callback_data": "cron_cancel"}]]})
+
+def _cron_finalize(cid: int):
+    """Simpan job dari _pending_cron[cid]['data']. Returns (ok, job|err)."""
+    st = _pending_cron.get(cid)
+    if not st:
+        return False, "wizard kadaluarsa"
+    d = st["data"]
+    sess = load_sess(cid)
+    store = _load_store(cid)
+    active = store.get("active", "main")
+    # thread_id: kalau wizard dimulai dari dalam topic, simpan biar output balik ke situ
+    thread_id = st.get("thread_id", 0)
+    target_win = d.get("target_win", "cron")
+    job = {"id": uuid.uuid4().hex[:8], "cid": cid, "thread_id": thread_id,
+           "type": d["type"], "prompt": d["prompt"], "title": d["prompt"][:40],
+           "target_win": target_win,
+           "target_sid": d.get("target_sid", ""),
+           "target_title": d.get("target_title", ""),
+           "workdir": sess["workdir"], "provider": sess.get("provider", PROVIDER),
+           "model": sess.get("model", MODEL_SLOT), "enabled": True,
+           "last_run": "", "run_count": 0,
+           "created": datetime.now().isoformat(timespec="seconds")}
+    if d["type"] in ("daily", "weekly", "once"):
+        job["time"] = d["time"]
+    if d["type"] == "weekly":
+        job["days"] = d["days"]
+    if d["type"] == "interval":
+        job["interval_h"] = d["interval_h"]
+        job["anchor"] = datetime.now().isoformat(timespec="seconds")
+    if d["type"] == "once":
+        job["date"] = d["date"]
+    jobs = _load_cron()
+    jobs.append(job)
+    _save_cron(jobs)
+    _pending_cron.pop(cid, None)
+    return True, job
+
 
 # ── Main ────────────────────────────────────────────────────────────────────
 def main():
@@ -4035,8 +5845,8 @@ def main():
             {"command": "pwd", "description": "📂 Show workdir"},
             {"command": "restart", "description": "♻️ Restart bot"},
             {"command": "update", "description": "⬇️ Update bot dari GitHub + restart"},
-            {"command": "compact", "description": "🗜️ Ringkas + fresh context (hemat token)"},
             {"command": "undo", "description": "↩️ Mundurkan N turn terakhir"},
+            {"command": "compact", "description": "🧹 Ringkas konteks sesi (native)"},
             {"command": "clear", "description": "🧹 Bersihkan layar & sesi baru"},
         ])
         log("Commands registered with Telegram")
