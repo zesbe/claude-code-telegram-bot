@@ -44,3 +44,4 @@ public/
 # OS
 .DS_Store
 Thumbs.db
+mcp-enabled.json

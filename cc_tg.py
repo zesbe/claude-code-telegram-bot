@@ -1313,6 +1313,7 @@ def new_session(cid: int):
         "model": old.get("model", MODEL_SLOT),
     }
     _save_store(cid)
+    _prewarm_async(cid)   # siapkan proses claude di muka → pesan pertama ~1 dtk
 
 # ── Context window per SLOT model ─────────────────────────────────────────────
 # Dipakai cuma buat NAMPILIN footer "ctx Nk/limitk" (info). Compaction sendiri
@@ -1357,6 +1358,19 @@ def win_list(cid: int) -> list[dict]:
 # panah, jadi padanannya: tiap window jadi TOMBOL inline yang di-tap untuk
 # pindah (set active). Window = "agent/sesi" paralel; yang lagi jalan = _busy.
 
+def _av_titles(wins: dict) -> dict:
+    """Map session_id → judul (dari file sesi, sumber sama dgn /resume)."""
+    titles = {}
+    for wd in {w.get("workdir", WORKDIR) for w in wins.values()}:
+        try:
+            for s in _cc_sessions(wd):
+                t = (s.get("title") or s.get("summary") or "").strip()
+                if t:
+                    titles[s["id"]] = t
+        except Exception:
+            pass
+    return titles
+
 def _agentview_text(cid: int) -> str:
     store = _load_store(cid)
     active = store.get("active", "main")
@@ -1364,24 +1378,33 @@ def _agentview_text(cid: int) -> str:
     running = {w for (ci, w) in _busy if ci == cid}
     if not wins:
         return "🤖 *Agent View*\n\nBelum ada sesi. Kirim pesan untuk memulai."
-    n_run = len(running)
-    n_idle = len(wins) - n_run
-    lines = [f"🤖 *Agent View* — {len(wins)} sesi ({n_run} kerja · {n_idle} idle)\n"]
+    titles = _av_titles(wins)
+    n_run = len(running & set(wins))
+    home = str(Path.home())
+    lines = [f"🤖 *Agent View* — {len(wins)} sesi · {n_run} lagi kerja\n"]
     for name, w in wins.items():
-        is_act = name == active
+        sid = w.get("session_id", "")
         if name in running:
-            state = "🟢 kerja"
+            state = "🟢 lagi kerja"
+        elif _WARM.is_warm(sid):
+            state = "🔥 siap — respon ~1 dtk"
         else:
             state = "⚪ idle"
-        here = " ← di sini" if is_act else ""
-        model = w.get("model", MODEL_SLOT)
-        prov = w.get("provider", PROVIDER)
+        here = "  ← *kamu di sini*" if name == active else ""
+        title = titles.get(sid, "")
+        head = f"*{name}*" + (f" — _{title[:36]}_" if title else "")
+        wd = w.get("workdir", WORKDIR).replace(home, "~")
+        info = (f"   {state}{here}\n"
+                f"   `{w.get('provider', PROVIDER)}/{w.get('model', MODEL_SLOT)}`"
+                f" · 📂 {wd}")
         qn = len(w.get("queue") or [])
-        extra = f" · antri {qn}" if qn else ""
-        lines.append(f"• *{name}* — {state} · `{prov}/{model}`{extra}{here}")
+        if qn:
+            info += f" · 📥 antri {qn}"
+        lines.append(f"{head}\n{info}")
     slots = MAX_CONCURRENT - _claude_slots._value
-    lines.append(f"\n⚙️ Slot global: {slots}/{MAX_CONCURRENT} dipakai")
-    lines.append("_Tap sesi untuk pindah. 🟢 = tap lagi untuk ⏹ stop._")
+    lines.append(f"\n⚙️ Slot global {slots}/{MAX_CONCURRENT} dipakai")
+    lines.append("💡 *Cara pakai:* tap nama sesi = pindah ke sana · "
+                 "⏹ = hentikan · 🆕 = sesi baru · 🔌 = kelola MCP")
     return "\n".join(lines)
 
 
@@ -1391,20 +1414,28 @@ def _agentview_kb(cid: int) -> dict:
     wins = store.get("windows", {})
     running = {w for (ci, w) in _busy if ci == cid}
     rows = []
-    for name in wins:
+    for name, w in wins.items():
         is_act = name == active
-        mark = "🟢" if name in running else ("🎯" if is_act else "⚪")
-        label = f"{mark} {name[:28]}" + (" •" if is_act else "")
+        if name in running:
+            mark = "🟢"
+        elif _WARM.is_warm(w.get("session_id", "")):
+            mark = "🔥"
+        else:
+            mark = "🎯" if is_act else "⚪"
+        label = f"{mark} {name[:28]}" + (" ←" if is_act else "")
         row = [{"text": label, "callback_data": f"av:sw:{name[:40]}"}]
         # sesi yang lagi kerja → tombol ⏹ stop di sebelahnya
         if name in running:
-            row.append({"text": "⏹", "callback_data": f"av:st:{name[:40]}"})
+            row.append({"text": "⏹ Stop", "callback_data": f"av:st:{name[:40]}"})
         rows.append(row)
     rows.append([
         {"text": "🆕 Sesi baru", "callback_data": "av:new"},
         {"text": "🔄 Segarkan", "callback_data": "av:rf"},
     ])
-    rows.append([{"text": "✖️ Tutup", "callback_data": "m_close"}])
+    rows.append([
+        {"text": "🔌 MCP servers", "callback_data": "mcp:open"},
+        {"text": "✖️ Tutup", "callback_data": "m_close"},
+    ])
     return {"inline_keyboard": rows}
 
 
@@ -1414,6 +1445,210 @@ def _agentview_refresh(cid: int, mid: int):
         tg_api("editMessageText", chat_id=cid, message_id=mid,
                text=_to_md(_agentview_text(cid)), parse_mode="MarkdownV2",
                reply_markup=_agentview_kb(cid))
+    except Exception:
+        pass
+
+
+# ── MCP manager (self-contained; mekanisme sama dgn terminal) ────────────────
+# Status = `claude mcp list` (health-check CLI ASLI, bukan tebakan).
+# On/off  = edit enabled/disabledMcpjsonServers di ~/.claude.json per project —
+#           field PERSIS yang dipakai Claude Code (CLI tak punya subcommand
+#           enable/disable). Backup + tulis atomic sebelum ubah.
+_MCP_LINE_RE = re.compile(r"^(.+?):\s+(.+?)\s+-\s+(✔|✘|!)\s+(.+)$")
+_MCP_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,60}$")
+_MCP_CACHE = {"at": 0.0, "servers": None}   # cache 60 dtk (health-check ±10 dtk)
+
+def _mcp_json_names() -> set:
+    """Nama server di ~/.mcp.json — cuma ini yang bisa di-on/off dari bot
+    (connector claude.ai & server plugin dikelola di tempat lain)."""
+    try:
+        data = json.loads((Path.home() / ".mcp.json").read_text(encoding="utf-8"))
+        return set((data.get("mcpServers") or {}).keys())
+    except Exception:
+        return set()
+
+def _mcp_disabled(project: str) -> set:
+    try:
+        data = json.loads((Path.home() / ".claude.json").read_text(encoding="utf-8"))
+        proj = (data.get("projects") or {}).get(project, {})
+        return set(proj.get("disabledMcpjsonServers", []))
+    except Exception:
+        return set()
+
+def _mcp_enabled_names(project: str) -> set:
+    """Server .mcp.json yang DINYALAKAN user utk project ini (enabled minus
+    disabled). Ini yang benar-benar dimuat bot via --mcp-config."""
+    try:
+        data = json.loads((Path.home() / ".claude.json").read_text(encoding="utf-8"))
+        proj = (data.get("projects") or {}).get(project, {})
+        en = set(proj.get("enabledMcpjsonServers", []))
+        dis = set(proj.get("disabledMcpjsonServers", []))
+        return (en - dis) & _mcp_json_names()
+    except Exception:
+        return set()
+
+_MCP_CFG_CACHE = {"key": None, "path": None}
+
+def _mcp_config_args(project: str) -> list:
+    """Args `--mcp-config <file>` berisi HANYA server .mcp.json yang di-enable
+    via /mcp. PENTING: mode -p TIDAK memuat .mcp.json otomatis (terbukti probe
+    2026-07-11 — enabledMcpjsonServers & enableAllProjectMcpServers diabaikan
+    di print mode), jadi bot suntik file konfig tersaring eksplisit.
+    File bisa berisi env/token → mode 600, jangan pernah di-log isinya."""
+    names = sorted(_mcp_enabled_names(project))
+    if not names:
+        return []
+    try:
+        src = json.loads((Path.home() / ".mcp.json").read_text(encoding="utf-8"))
+        allsrv = src.get("mcpServers") or {}
+        servers = {n: allsrv[n] for n in names if n in allsrv}
+    except Exception:
+        return []
+    if not servers:
+        return []
+    key = json.dumps(servers, sort_keys=True)
+    if (_MCP_CFG_CACHE["key"] == key and _MCP_CFG_CACHE["path"]
+            and Path(_MCP_CFG_CACHE["path"]).exists()):
+        return ["--mcp-config", _MCP_CFG_CACHE["path"]]
+    path = BOT_DIR / "mcp-enabled.json"
+    path.write_text(json.dumps({"mcpServers": servers}, indent=2),
+                    encoding="utf-8")
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+    _MCP_CFG_CACHE.update(key=key, path=str(path))
+    return ["--mcp-config", str(path)]
+
+def _mcp_servers(force: bool = False) -> list:
+    """Jalankan `claude mcp list` + parse. Hasil di-cache 60 dtk supaya tombol
+    toggle/refresh nggak nunggu health-check 10 dtk tiap tap."""
+    now = time.time()
+    if (not force and _MCP_CACHE["servers"] is not None
+            and now - _MCP_CACHE["at"] < 60):
+        return _MCP_CACHE["servers"]
+    out = ""
+    try:
+        r = subprocess.run([get_claude_bin(None), "mcp", "list"], cwd=WORKDIR,
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            out = r.stdout
+    except Exception:
+        pass
+    servers = []
+    for line in out.splitlines():
+        m = _MCP_LINE_RE.match(line.strip())
+        if not m:
+            continue
+        name, target, icon, st = m.groups()
+        if name.strip() in _mcp_json_names():
+            continue   # server .mcp.json dirender dari state enable/init
+        servers.append({"name": name.strip(), "target": target.strip(),
+                        "icon": icon, "status": st.strip()})
+    _MCP_CACHE.update(at=now, servers=servers)
+    return servers
+
+def _mcp_toggle(name: str, enabled: bool, project: str) -> bool:
+    """Nyalakan/matikan server utk project ini — file & field sama persis
+    dgn Claude Code asli. Return False kalau gagal baca/tulis."""
+    cj = Path.home() / ".claude.json"
+    try:
+        data = json.loads(cj.read_text(encoding="utf-8")) if cj.exists() else {}
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    proj = data.setdefault("projects", {}).setdefault(project, {})
+    en = set(proj.get("enabledMcpjsonServers", []))
+    dis = set(proj.get("disabledMcpjsonServers", []))
+    if enabled:
+        dis.discard(name); en.add(name)
+    else:
+        en.discard(name); dis.add(name)
+    proj["enabledMcpjsonServers"] = sorted(en)
+    proj["disabledMcpjsonServers"] = sorted(dis)
+    try:
+        (cj.parent / f".claude.json.bak.{int(time.time())}").write_text(
+            cj.read_text(encoding="utf-8"), encoding="utf-8")
+    except Exception:
+        pass
+    try:
+        tmp = cj.parent / f".claude.json.tmp.{os.getpid()}"
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                       encoding="utf-8")
+        os.replace(tmp, cj)
+        return True
+    except Exception:
+        return False
+
+def _mcp_panel_text(cid: int) -> str:
+    project = load_sess(cid).get("workdir", WORKDIR)
+    enabled = _mcp_enabled_names(project)
+    sess_state = _MCP_SESSION_STATE["servers"]
+    lines = ["🔌 *MCP Servers*",
+             f"📂 Project: `{project.replace(str(Path.home()), '~')}`\n"]
+
+    # ── Bagian 1: server project (.mcp.json) — bisa di-on/off dari sini ──
+    names = sorted(_mcp_json_names())
+    if names:
+        lines.append(f"*Punya project* — {len(enabled)}/{len(names)} nyala:")
+        for n in names:
+            if n not in enabled:
+                lines.append(f"⚫ *{n}* — mati")
+            elif sess_state.get(n) == "connected":
+                lines.append(f"🟢 *{n}* — nyala · nyambung")
+            elif sess_state.get(n) == "failed":
+                lines.append(f"🔴 *{n}* — nyala tapi gagal konek")
+            else:
+                lines.append(f"🔵 *{n}* — nyala (dimuat di pesan berikutnya)")
+        lines.append("")
+
+    # ── Bagian 2: bawaan akun/plugin — kelola di terminal / claude.ai ──
+    others = _mcp_servers()
+    if others:
+        lines.append("*Bawaan akun/plugin* (kelola di terminal):")
+        for s in others:
+            if s["icon"] == "✔":
+                lines.append(f"🟢 {s['name']} — nyambung")
+            elif s["icon"] == "✘":
+                lines.append(f"🔴 {s['name']} — gagal konek")
+            elif s["icon"] == "!":
+                lines.append(f"🟡 {s['name']} — perlu login")
+            else:
+                lines.append(f"⚪ {s['name']} — {s['status'][:40]}")
+
+    lines.append("\n💡 *Cara pakai:* tap tombol server = nyalakan (▶️) / "
+                 "matikan (⏸). Langsung dipakai pesan berikutnya.")
+    lines.append("_Makin banyak yang nyala = start sesi makin berat — "
+                 "nyalakan yang perlu saja._")
+    return "\n".join(lines)
+
+def _mcp_panel_kb(cid: int) -> dict:
+    project = load_sess(cid).get("workdir", WORKDIR)
+    enabled = _mcp_enabled_names(project)
+    rows, pair = [], []
+    for name in sorted(_mcp_json_names()):
+        if not _MCP_NAME_RE.fullmatch(name):
+            continue
+        on = name in enabled
+        label = f"{'⏸' if on else '▶️'} {name[:24]}"
+        pair.append({"text": label, "callback_data": f"mcp:t:{name[:40]}"})
+        if len(pair) == 2:
+            rows.append(pair); pair = []
+    if pair:
+        rows.append(pair)
+    rows.append([
+        {"text": "🔄 Cek ulang", "callback_data": "mcp:hard"},
+        {"text": "🤖 Agent View", "callback_data": "av:rf"},
+    ])
+    rows.append([{"text": "✖️ Tutup", "callback_data": "m_close"}])
+    return {"inline_keyboard": rows}
+
+def _mcp_panel_refresh(cid: int, mid: int):
+    try:
+        tg_api("editMessageText", chat_id=cid, message_id=mid,
+               text=_to_md(_mcp_panel_text(cid)), parse_mode="MarkdownV2",
+               reply_markup=_mcp_panel_kb(cid))
     except Exception:
         pass
 
@@ -1432,6 +1667,7 @@ def win_switch(cid: int, name: str, workdir: str = None) -> dict:
         store["windows"][name]["workdir"] = workdir
     store["active"] = name
     _save_store(cid)
+    _prewarm_async(cid)   # siapkan proses claude di muka → pesan pertama ~1 dtk
     return store["windows"][name]
 
 def win_close(cid: int, name: str) -> bool:
@@ -1640,10 +1876,22 @@ class _WarmCancelled(Exception):
 class _WarmTimeout(Exception):
     pass
 
+# Status MCP NYATA per sesi — diisi dari event init tiap spawn claude
+# (ground truth: server yang benar2 dimuat + connected/failed).
+_MCP_SESSION_STATE = {"at": 0.0, "servers": {}}
+
 def _handle_stream_ev(ev: dict, holder: dict, _emit):
     """Proses SATU event NDJSON dari claude CLI: sinkronkan holder (result,
     usage, buffer teks) + emit event sintetis stream_text/stream_think.
     Dipakai jalur cold DAN warm supaya rendering live-nya identik."""
+    if ev.get("type") == "system" and ev.get("subtype") == "init":
+        try:
+            _MCP_SESSION_STATE["at"] = time.time()
+            _MCP_SESSION_STATE["servers"] = {
+                m.get("name"): m.get("status", "?")
+                for m in (ev.get("mcp_servers") or [])}
+        except Exception:
+            pass
     if ev.get("type") == "assistant":
         # ⚠️ URUTAN CLI (terbukti probe 2026-07-02): event
         # `assistant [text]` keluar SEBELUM content_block_stop
@@ -1729,6 +1977,7 @@ class _WarmProc:
         self.model = model
         self.effort = effort
         self.last_used = time.time()
+        self.turn_lock = threading.Lock()   # 1 turn pada satu waktu per proses
         self.proc = self._spawn()
 
     def _spawn(self):
@@ -1752,6 +2001,7 @@ class _WarmProc:
                "--append-system-prompt", TELE_SYSTEM_PROMPT]
         if self.effort and self.effort in EFFORT_LEVELS:
             cmd += ["--effort", self.effort]
+        cmd += _mcp_config_args(self.workdir)   # MCP yang di-enable via /mcp
         cmd.append("--dangerously-skip-permissions")
         # stderr → DEVNULL: kalau turn warm gagal, fallback cold yang
         # nangkep detail errornya. start_new_session → kill 1 pohon (MCP dkk).
@@ -1772,10 +2022,35 @@ class _WarmProc:
         except Exception:
             pass
 
+    def interrupt(self) -> bool:
+        """Setop turn berjalan TANPA bunuh proses (setara ESC di terminal).
+        CLI balas control_response + result subtype=error_during_execution,
+        proses tetap hidup — VERIFIED CLI 2.1.206. Return False = stdin putus."""
+        try:
+            self.proc.stdin.write((json.dumps(
+                {"type": "control_request",
+                 "request_id": f"intr-{int(time.time()*1000)}",
+                 "request": {"subtype": "interrupt"}}) + "\n").encode())
+            self.proc.stdin.flush()
+            return True
+        except Exception:
+            return False
+
     def run_turn(self, prompt, on_event, lock_key):
         """Kirim 1 pesan via stdin, baca event sampai `result` (proses TETAP
         hidup buat turn berikutnya). Raise: _WarmCancelled (di-/stop),
         _WarmTimeout, RuntimeError (proses/stdin mati → caller fallback cold)."""
+        # /stop bisa lepas _busy lebih dulu → pesan baru masuk saat turn lama
+        # masih beres-beres pasca-interrupt. Lock cegah 2 reader di stdout sama.
+        if not self.turn_lock.acquire(timeout=15):
+            self.kill()
+            raise RuntimeError("warm proc masih sibuk turn sebelumnya")
+        try:
+            return self._run_turn_locked(prompt, on_event, lock_key)
+        finally:
+            self.turn_lock.release()
+
+    def _run_turn_locked(self, prompt, on_event, lock_key):
         def _emit(e):
             if on_event:
                 try:
@@ -1815,16 +2090,24 @@ class _WarmProc:
         t = threading.Thread(target=_reader, daemon=True)
         t.start()
         start = time.time()
+        intr_at = 0.0
         while not done.is_set():
             if lock_key is not None and lock_key in _cancelled:
-                self.kill()
-                raise _WarmCancelled()
+                # GRACEFUL: interrupt dulu (turn berhenti, proses+MCP tetap
+                # hidup → pesan berikutnya tetap warm ~1 dtk). Kill hanya
+                # kalau interrupt gak mempan 10 dtk / stdin sudah putus.
+                if not intr_at:
+                    intr_at = time.time()
+                    if not self.interrupt():
+                        self.kill()
+                elif time.time() - intr_at > 10:
+                    self.kill()
             if time.time() - start > CLAUDE_TIMEOUT:
                 self.kill()
                 raise _WarmTimeout()
-            done.wait(0.5)
-        # Tombol ⏹ Stop bisa kill proses DULUAN (via _running_procs) sebelum
-        # loop di atas lihat _cancelled → reader EOF. Cek lagi di sini supaya
+            done.wait(0.3)
+        # Handler /stop lama bisa kill proses DULUAN (via _running_procs)
+        # sebelum loop lihat _cancelled → reader EOF. Cek lagi di sini supaya
         # cancel TIDAK dianggap crash (crash = fallback cold = prompt jalan 2x).
         if lock_key is not None and lock_key in _cancelled:
             raise _WarmCancelled()
@@ -1863,6 +2146,27 @@ class _WarmPool:
         if wp:
             wp.kill()
 
+    def owns(self, proc) -> bool:
+        """Proc ini milik pool? Dipakai handler /stop: warm → interrupt
+        (jangan kill), cold → kill pohon seperti biasa."""
+        with self._lock:
+            return any(w.proc is proc for w in self._procs.values())
+
+    def discard_all(self):
+        """Buang SEMUA proses — dipanggil saat config MCP berubah (proses
+        lama masih bawa set MCP lama). Respawn otomatis di pesan berikutnya."""
+        with self._lock:
+            procs = list(self._procs.values())
+            self._procs.clear()
+        for w in procs:
+            w.kill()
+
+    def is_warm(self, session_id) -> bool:
+        """Sesi punya proses hidup siap pakai? (utk status 🔥 di Agent View)"""
+        with self._lock:
+            wp = self._procs.get(session_id)
+            return bool(wp and wp.alive())
+
     def _janitor(self):
         while True:
             time.sleep(60)
@@ -1875,6 +2179,32 @@ class _WarmPool:
                     self._procs.pop(sid, None)
 
 _WARM = _WarmPool()
+
+def _prewarm_async(cid: int):
+    """PRE-WARM: spawn proses claude utk window AKTIF chat ini di background.
+    Dipanggil saat pindah window / sesi baru / resume — pas user selesai
+    ngetik pesan pertama, prosesnya sudah siap → turn-1 pun ~1 dtk, bukan
+    cold 3-9 dtk. Gagal pun tak apa (jalur biasa tetap jalan)."""
+    if not WARM_ENABLED:
+        return
+    def _go():
+        try:
+            store = _load_store(cid)
+            active = store.get("active", "main")
+            if (cid, active) in _busy:
+                return               # ada task jalan — jangan dobel proses
+            w = store.get("windows", {}).get(active) or {}
+            sid = w.get("session_id")
+            if not sid:
+                return
+            eff = w.get("effort")
+            _WARM.get(cid, w.get("workdir", WORKDIR), sid,
+                      w.get("provider", DEFAULT_PROVIDER),
+                      w.get("model", MODEL_SLOT),
+                      eff if eff in EFFORT_LEVELS else None)
+        except Exception:
+            pass
+    threading.Thread(target=_go, daemon=True).start()
 
 def run_claude(prompt: str, chat_id: int, workdir: str, session_id: str,
                provider: str = None, model: str = None,
@@ -1933,7 +2263,10 @@ def run_claude(prompt: str, chat_id: int, workdir: str, session_id: str,
                     return result_text, usage
                 _WARM.discard(session_id)   # result kosong → coba jalur cold
             except _WarmCancelled:
-                _WARM.discard(session_id)
+                # Interrupt graceful: proses biasanya MASIH hidup → simpan di
+                # pool biar pesan berikutnya tetap ~1 dtk. Buang cuma yg mati.
+                if not wp.alive():
+                    _WARM.discard(session_id)
                 return "⏹ Dibatalkan.", {}
             except _WarmTimeout:
                 _WARM.discard(session_id)
@@ -1954,6 +2287,7 @@ def run_claude(prompt: str, chat_id: int, workdir: str, session_id: str,
                 "--append-system-prompt", TELE_SYSTEM_PROMPT]
         if effort and effort in EFFORT_LEVELS:
             base += ["--effort", effort]
+        base += _mcp_config_args(workdir)   # MCP yang di-enable via /mcp
         base += ["--dangerously-skip-permissions", prompt]
         return base
 
@@ -2133,7 +2467,8 @@ Di grup pakai Topics: tiap topic = project terpisah
 **🆕 Sesi & window**
 • `/new [nama]` — window/sesi baru (fresh context)
 • `/title <judul>` — beri judul sesi sekarang
-• `/agents` (`/tasks`) — lihat window/task yang lagi jalan
+• `/agents` (`/tasks`) — Agent View: daftar sesi, pindah, stop
+• `/mcp` — status MCP servers + nyalakan/matikan per server
 
 **⏯ Kontrol saat kerja**
 • `/queue <prompt>` (`/q`) — antri; jalan setelah task sekarang kelar
@@ -2362,7 +2697,9 @@ def handle_callback(cb: dict):
         lock_key = (cid, win_name)
         _cancelled.add(lock_key)
         proc = _running_procs.get(lock_key)
-        if proc:
+        if proc and not _WARM.owns(proc):
+            # cold → kill pohon. Warm → JANGAN kill: run_turn kirim interrupt
+            # ≤0.3 dtk (turn berhenti, proses+MCP selamat, tetap cepat).
             _kill_process_tree(proc)
         # Immediately free the lock so user can send new messages
         _busy.discard(lock_key)
@@ -2387,15 +2724,40 @@ def handle_callback(cb: dict):
             lk = (cid, name)
             _cancelled.add(lk)
             p = _running_procs.get(lk)
-            if p:
+            if p and not _WARM.owns(p):     # warm → interrupt via run_turn
                 _kill_process_tree(p)
             _busy.discard(lk)
             _agentview_refresh(cid, mid)
         elif sub == "new":                  # sesi baru di window aktif
             new_session(cid)
             _agentview_refresh(cid, mid)
-        elif sub == "rf":                   # refresh
+        elif sub == "rf":
             _agentview_refresh(cid, mid)
+        return
+
+    # ── Panel MCP: on/off server / cek ulang ────────────────────────────────
+    if data.startswith("mcp:"):
+        sub = data[4:]
+        if sub in ("open", "hard"):
+            # health-check bisa ±10 dtk → kasih tanda loading dulu
+            try:
+                tg_api("editMessageText", chat_id=cid, message_id=mid,
+                       text="🔌 Cek status MCP… (±10 dtk)", parse_mode="")
+            except Exception:
+                pass
+            _mcp_servers(force=(sub == "hard"))
+            _mcp_panel_refresh(cid, mid)
+        elif sub.startswith("t:"):
+            name = sub[2:]
+            project = load_sess(cid).get("workdir", WORKDIR)
+            if name in _mcp_json_names() and _MCP_NAME_RE.fullmatch(name):
+                turn_on = name not in _mcp_enabled_names(project)
+                ok = _mcp_toggle(name, enabled=turn_on, project=project)
+                if ok:
+                    # proses warm masih bawa set MCP lama → buang; respawn
+                    # otomatis dgn config baru di pesan berikutnya
+                    _WARM.discard_all()
+            _mcp_panel_refresh(cid, mid)
         return
 
     # "✂️ Pecah buat copy": kirim ulang jawaban sbg pesan-pesan kecil per
@@ -2899,6 +3261,7 @@ def handle_callback(cb: dict):
             sess = load_sess(cid)
             sess["session_id"] = s["id"]
             save_sess(cid)
+            _prewarm_async(cid)   # proses siap duluan → pesan pertama ~1 dtk
             label = s["summary"] if s["summary"] else "(tanpa judul)"
             hist = _session_recent_history(sess["workdir"], s["id"], n_pairs=5)
             msg = (f"✅ *Lanjut sesi*\n\n"
@@ -3607,6 +3970,7 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
                 new_id = match[0]["id"]
                 sess["session_id"] = new_id
                 save_sess(cid)
+                _prewarm_async(cid)   # proses siap duluan → pesan pertama ~1 dtk
                 prov_info = f" · provider `{target_provider}`" if target_provider else ""
                 return f"🔄 Lanjut sesi `{new_id[:12]}…` ({match[0]['time']}){prov_info}"
             return f"❌ Sesi tidak ketemu: `{target_sid}`\nKetik /resume untuk lihat daftar."
@@ -3855,17 +4219,17 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
             stray = [k for k in list(_running_procs) if k[0] == cid]
             for lk in stray:
                 p = _running_procs.pop(lk, None)
-                if p:
+                if p and not _WARM.owns(p):
                     try: _kill_process_tree(p)
                     except Exception: pass
             return ("⏹ Tidak ada task aktif. (State sudah dibersihkan.)"
                     if stray else "Tidak ada task yang sedang jalan.")
         killed = []
         for lk in targets:
-            _cancelled.add(lk)              # run_claude akan self-kill ≤0.5s kalau hidup
+            _cancelled.add(lk)              # warm: run_turn kirim interrupt ≤0.3s
             p = _running_procs.pop(lk, None)
-            if p:
-                try: _kill_process_tree(p)  # SIGTERM→SIGKILL ke seluruh process group
+            if p and not _WARM.owns(p):
+                try: _kill_process_tree(p)  # cold: SIGTERM→SIGKILL se-process-group
                 except Exception: pass
             _busy.discard(lk)              # PAKSA lepas lock — anti "masih kerja" nyangkut
             killed.append(lk[1])
@@ -3931,6 +4295,27 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
         save_sess(cid)
         return (f"📢 Verbose progress: *{'ON' if cur else 'OFF'}*\n"
                 f"{'Semua step (teks + thinking) tampil live.' if cur else 'Cuma tool penting yang tampil.'}")
+    if c == "/mcp":
+        # Panel MCP: health-check CLI ±10 dtk → kirim placeholder dulu,
+        # isi panel dari thread biar chat nggak keblokir.
+        thread_id = (msg or {}).get("message_thread_id", 0)
+        kw = {"chat_id": cid, "text": "🔌 Cek status MCP… (±10 dtk)"}
+        if thread_id:
+            kw["message_thread_id"] = thread_id
+        try:
+            d = tg_api("sendMessage", **kw)
+            pmid = (d.get("result") or {}).get("message_id")
+        except Exception:
+            return "❌ Gagal kirim panel MCP."
+        if pmid:
+            def _fill():
+                try:
+                    _mcp_servers(force=True)
+                    _mcp_panel_refresh(cid, pmid)
+                except Exception as e:
+                    log(f"/mcp fill error: {e}")
+            threading.Thread(target=_fill, daemon=True).start()
+        return None
     if c in ("/agents", "/tasks"):
         # Agent View interaktif: tiap window/sesi jadi tombol yang bisa di-tap
         # untuk PINDAH ke sana (padanan panah atas/bawah di terminal Claude).
@@ -5828,7 +6213,8 @@ def main():
             {"command": "queue", "description": "📥 Antri prompt (jalan berurutan)"},
             {"command": "background", "description": "🌙 Jalan paralel di window terpisah"},
             {"command": "retry", "description": "↻ Ulang pesan terakhir"},
-            {"command": "agents", "description": "🤖 Status task/window berjalan"},
+            {"command": "agents", "description": "🤖 Agent View: daftar sesi + pindah"},
+            {"command": "mcp", "description": "🔌 Status & on/off MCP servers"},
             {"command": "provider", "description": "🔌 Switch provider"},
             {"command": "model", "description": "⚙️ Switch model slot"},
             {"command": "effort", "description": "🎯 Atur kedalaman mikir (low→max)"},
