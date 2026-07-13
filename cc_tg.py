@@ -1487,7 +1487,26 @@ def new_session(cid: int):
 # 100% diurus NATIVE Claude Code (client-side, jalan di mode -p juga) — bot TIDAK
 # lagi pakai RESEED. Investigasi 2026-07-01: isCompactSummary native terbukti
 # muncul di sesi bot. Override per provider via config["context_windows"].
-CONTEXT_WINDOWS = {"opus": 1_000_000, "sonnet": 1_000_000, "haiku": 200_000}
+CONTEXT_WINDOWS = {"opus": 1_000_000, "sonnet": 1_000_000, "haiku": 200_000,
+                   "fable": 1_000_000}   # probed 2026-07-13: claude-fable-5 = 1M
+
+# Slot model per provider. "fable" HANYA ada di claude native: provider
+# pihak-ketiga cuma punya mapping opus/sonnet/haiku (providers.json), jadi
+# --model fable ke proxy = model tak dikenal.
+MODEL_SLOTS_NATIVE = ("opus", "sonnet", "haiku", "fable")
+MODEL_SLOTS_PROXY = ("opus", "sonnet", "haiku")
+
+def _model_slots_for(provider) -> tuple:
+    return MODEL_SLOTS_NATIVE if (provider or "claude") == "claude" else MODEL_SLOTS_PROXY
+
+def _guard_model_after_provider_switch(sess) -> str:
+    """Dipanggil SETELAH sess['provider'] diganti: kalau model window masih
+    'fable' padahal provider baru bukan claude native → reset ke opus.
+    Return catatan utk ditempel di pesan konfirmasi ('' kalau tak ada)."""
+    if sess.get("model") == "fable" and sess.get("provider") != "claude":
+        sess["model"] = "opus"
+        return "\n⚠️ Model `fable` cuma ada di claude native → model di-reset ke `opus`."
+    return ""
 CONTEXT_WINDOWS.update(CFG.get("context_windows", {}))
 
 def _ctx_limit_from_model_usage(model_usage) -> int:
@@ -2679,7 +2698,7 @@ Pakai **tombol di bawah** 👇 untuk navigasi cepat:
 💬 **Sesi** — pilih/lanjut percakapan
 🪟 **Project** — ganti folder kerja
 🔌 **Provider** — ganti AI (claude/zai/deepseek)
-🧠 **Model** — ganti model (opus/sonnet/haiku)
+🧠 **Model** — ganti model (opus/sonnet/haiku/fable*)
 📋 **Menu** — aksi cepat (files, git, search…)
 🆕 **Sesi Baru** — mulai dari awal
 
@@ -2711,7 +2730,7 @@ Di grup pakai Topics: tiap topic = project terpisah
 • `/provider del <nama>` — hapus provider
 • `/provider info <nama>` — detail provider
 • `/provider reload` — refresh dari Claude Hub
-• `/model` / `/model <slot>` — ganti model (opus/sonnet/haiku)
+• `/model` / `/model <slot>` — ganti model (opus/sonnet/haiku; `fable` khusus claude native)
 
 **⏱ Saat Claude bekerja**
 • Progress live tiap step (bash, tulis file, cari…)
@@ -2814,6 +2833,7 @@ MODEL_KB = {"inline_keyboard": [
     [{"text": "🔥 Opus (heavy)", "callback_data": "set_opus"},
      {"text": "⚡ Sonnet (balanced)", "callback_data": "set_sonnet"},
      {"text": "💨 Haiku (fast)", "callback_data": "set_haiku"}],
+    [{"text": "✨ Fable 5 (khusus claude native)", "callback_data": "set_fable"}],
     [{"text": "← Back", "callback_data": "m_back"},
      {"text": "✖️ Tutup", "callback_data": "m_close"}],
 ]}
@@ -3420,9 +3440,18 @@ def handle_callback(cb: dict):
         cur = load_sess(cid).get("effort") or "default"
         edit_md(cid, mid, f"🎯 Effort level (aktif: `{cur}`)\nMakin tinggi = mikir lebih dalam, lebih lama/mahal.",
                 reply_markup=EFFORT_KB)
-    elif data in ("set_opus", "set_sonnet", "set_haiku"):
+    elif data in ("set_opus", "set_sonnet", "set_haiku", "set_fable"):
         slot = data.replace("set_", "")
         sess = load_sess(cid)
+        if slot not in _model_slots_for(sess.get("provider")):
+            try:
+                tg_api("answerCallbackQuery", callback_query_id=cb_id,
+                       text="✨ Fable 5 cuma ada di provider claude (native). "
+                            "Pindah dulu: /provider claude",
+                       show_alert=True)
+            except Exception:
+                pass
+            return
         sess["model"] = slot           # per-window ONLY — jangan sentuh global MODEL_SLOT
         save_sess(cid)
         win = _load_store(cid).get("active", "main")
@@ -3595,9 +3624,10 @@ def handle_callback(cb: dict):
         if name == "claude" or name in PROVIDERS:
             sess = load_sess(cid)
             sess["provider"] = name    # per-window ONLY — jangan sentuh global PROVIDER
+            note = _guard_model_after_provider_switch(sess)
             save_sess(cid)
             win = _load_store(cid).get("active", "main")
-            edit_md(cid, mid, f"✅ Provider window **{win}** → `{name}`\n\nKirim pesan untuk lanjut.")
+            edit_md(cid, mid, f"✅ Provider window **{win}** → `{name}`{note}\n\nKirim pesan untuk lanjut.")
         else:
             edit_md(cid, mid, f"❌ Provider `{name}` tidak ada")
     elif data.startswith("rs_"):
@@ -4281,14 +4311,20 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
     if c == "/model":
         sess = load_sess(cid)
         cur = sess.get("model", MODEL_SLOT)
+        slots = _model_slots_for(sess.get("provider"))
         if not a:
             return (f"Model window ini: `{cur}`\n"
-                    "Pilihan: opus, sonnet, haiku")
-        if a in ("opus", "sonnet", "haiku"):
+                    f"Pilihan: {', '.join(slots)}"
+                    + ("" if "fable" in slots else
+                       "\n_(fable cuma di provider claude native)_"))
+        if a in slots:
             sess["model"] = a          # per-window ONLY — jangan sentuh global MODEL_SLOT
             save_sess(cid)
             return f"🔄 Model window **{_load_store(cid).get('active','main')}** → `{a}`"
-        return f"❌ Tidak dikenal: `{a}`\nPilihan: opus, sonnet, haiku"
+        if a == "fable":
+            return ("❌ `fable` cuma ada di provider claude (native).\n"
+                    "Pindah dulu: `/provider claude`, lalu `/model fable`.")
+        return f"❌ Tidak dikenal: `{a}`\nPilihan: {', '.join(slots)}"
     if c == "/resume":
         sess = load_sess(cid)
         wd = sess["workdir"]
@@ -4313,6 +4349,7 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
         # Switch provider if specified — per-window ONLY (jangan sentuh global)
         if target_provider and target_provider in PROVIDERS:
             sess["provider"] = target_provider
+            _guard_model_after_provider_switch(sess)
             save_sess(cid)
         # If a specific session ID is provided, switch to it
         if target_sid and len(target_sid) >= 8:
@@ -4520,8 +4557,10 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
         if action == "claude" or action in PROVIDERS:
             sess = load_sess(cid)
             sess["provider"] = action  # per-window ONLY — jangan sentuh global PROVIDER
+            note = _guard_model_after_provider_switch(sess)
             save_sess(cid)
-            return f"🔄 Provider window **{_load_store(cid).get('active','main')}** → `{action}`"
+            return (f"🔄 Provider window **{_load_store(cid).get('active','main')}** "
+                    f"→ `{action}`{note}")
         return (f"❌ Tidak ada: `{action}`\n\n"
                 f"Provider: {', '.join(sorted(PROVIDERS.keys()))}\n"
                 f"Kelola: `/provider add|edit|del|info|test|models|reload`")
