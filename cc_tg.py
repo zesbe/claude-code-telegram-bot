@@ -1560,10 +1560,13 @@ def _agentview_text(cid: int) -> str:
             block += "\n" + "\n".join(extra)
         lines.append(block)
     slots = MAX_CONCURRENT - _claude_slots._value
-    lines.append(f"\n⚙️ Slot global {slots}/{MAX_CONCURRENT} dipakai")
+    lines.append(f"\n⚡ Kapasitas paralel: {slots} jalan dari maks "
+                 f"{MAX_CONCURRENT} task bareng")
     if any_busy:
-        lines.append("🔄 _Panel ini update sendiri tiap ±4 dtk selama ada "
-                     "yang kerja._")
+        lines.append("🔄 _Panel update sendiri tiap ±4 dtk._")
+    else:
+        lines.append("🔄 _Panel bangun sendiri begitu ada task masuk "
+                     "(±5 mnt sejak dibuka)._")
     lines.append("💡 *Cara pakai:* tap nama sesi = pindah ke sana · "
                  "⏹ = hentikan · 🆕 = sesi baru · 🔌 = kelola MCP")
     return "\n".join(lines)
@@ -1613,26 +1616,28 @@ def _agentview_refresh(cid: int, mid: int):
 _av_live: dict = {}   # (cid, mid) -> token: panel yang lagi auto-refresh
 
 def _agentview_autorefresh(cid: int, mid: int):
-    """Panel /agents jadi LIVE: selama ada window yang kerja, edit panel tiap
-    ±4 dtk (durasi/aktivitas/subagent jalan terus keliatan bergerak). Berhenti
-    sendiri saat semua idle, panel ditutup/diganti, atau maks ~3 menit.
-    Token registry cegah 2 loop di panel yang sama."""
+    """Panel /agents jadi LIVE selama ±5 menit sejak dibuka/di-tap:
+    - ada window kerja → refresh tiap 4 dtk (durasi/aktivitas bergerak);
+    - lagi idle → PANTAU tiap 2 dtk, dan begitu ada task masuk / selesai
+      (transisi kerja↔idle) panel langsung di-refresh. (Dulu loop berhenti
+      kalau dibuka saat idle → panel 'mati' walau task masuk — itu bugnya.)
+    Token registry cegah 2 loop di panel yang sama; loop lama gugur sendiri."""
     if not mid:
         return
     tok = uuid.uuid4().hex[:6]
     _av_live[(cid, mid)] = tok
     def _loop():
         try:
-            for _ in range(45):
-                if not any(ci == cid for (ci, _w) in _busy):
-                    break
-                time.sleep(4)
+            was_busy = any(ci == cid for (ci, _w) in _busy)
+            t_end = time.time() + 300
+            while time.time() < t_end:
+                time.sleep(4 if was_busy else 2)
                 if _av_live.get((cid, mid)) != tok:
                     return   # ditutup / diganti panel MCP / loop baru
-                _agentview_refresh(cid, mid)
-            # render terakhir: status idle final
-            if _av_live.get((cid, mid)) == tok:
-                _agentview_refresh(cid, mid)
+                busy = any(ci == cid for (ci, _w) in _busy)
+                if busy or busy != was_busy:
+                    _agentview_refresh(cid, mid)
+                was_busy = busy
         finally:
             if _av_live.get((cid, mid)) == tok:
                 _av_live.pop((cid, mid), None)
