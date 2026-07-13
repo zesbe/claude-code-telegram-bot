@@ -1519,10 +1519,28 @@ def _agentview_text(cid: int) -> str:
     n_run = len(running & set(wins))
     home = str(Path.home())
     lines = [f"🤖 *Agent View* — {len(wins)} sesi · {n_run} lagi kerja\n"]
+    now = time.time()
+    any_busy = False
     for name, w in wins.items():
         sid = w.get("session_id", "")
+        act = _ACT.get((cid, name)) or {}
+        extra = []
         if name in running:
-            state = "🟢 lagi kerja"
+            any_busy = True
+            state = f"🟢 lagi kerja — {_fmt_dur(now - act.get('start', now))}"
+            if act.get("label"):
+                extra.append(f"   ⚙️ {act['label'][:52]}")
+            ags = list((act.get("agents") or {}).values())
+            if ags:
+                extra.append("   🤖 *Subagent:*")
+                for a in ags[-4:]:
+                    tp = f" [{a['type']}]" if a.get("type") else ""
+                    if a["done"]:
+                        extra.append(f"      ✅ {a['desc'][:30]}{tp} "
+                                     f"({_fmt_dur(a['dur'])})")
+                    else:
+                        extra.append(f"      🟢 {a['desc'][:30]}{tp} — "
+                                     f"{_fmt_dur(now - a['since'])}")
         elif _WARM.is_warm(sid):
             state = "🔥 siap — respon ~1 dtk"
         else:
@@ -1537,9 +1555,15 @@ def _agentview_text(cid: int) -> str:
         qn = len(w.get("queue") or [])
         if qn:
             info += f" · 📥 antri {qn}"
-        lines.append(f"{head}\n{info}")
+        block = f"{head}\n{info}"
+        if extra:
+            block += "\n" + "\n".join(extra)
+        lines.append(block)
     slots = MAX_CONCURRENT - _claude_slots._value
     lines.append(f"\n⚙️ Slot global {slots}/{MAX_CONCURRENT} dipakai")
+    if any_busy:
+        lines.append("🔄 _Panel ini update sendiri tiap ±4 dtk selama ada "
+                     "yang kerja._")
     lines.append("💡 *Cara pakai:* tap nama sesi = pindah ke sana · "
                  "⏹ = hentikan · 🆕 = sesi baru · 🔌 = kelola MCP")
     return "\n".join(lines)
@@ -1584,6 +1608,35 @@ def _agentview_refresh(cid: int, mid: int):
                reply_markup=_agentview_kb(cid))
     except Exception:
         pass
+
+
+_av_live: dict = {}   # (cid, mid) -> token: panel yang lagi auto-refresh
+
+def _agentview_autorefresh(cid: int, mid: int):
+    """Panel /agents jadi LIVE: selama ada window yang kerja, edit panel tiap
+    ±4 dtk (durasi/aktivitas/subagent jalan terus keliatan bergerak). Berhenti
+    sendiri saat semua idle, panel ditutup/diganti, atau maks ~3 menit.
+    Token registry cegah 2 loop di panel yang sama."""
+    if not mid:
+        return
+    tok = uuid.uuid4().hex[:6]
+    _av_live[(cid, mid)] = tok
+    def _loop():
+        try:
+            for _ in range(45):
+                if not any(ci == cid for (ci, _w) in _busy):
+                    break
+                time.sleep(4)
+                if _av_live.get((cid, mid)) != tok:
+                    return   # ditutup / diganti panel MCP / loop baru
+                _agentview_refresh(cid, mid)
+            # render terakhir: status idle final
+            if _av_live.get((cid, mid)) == tok:
+                _agentview_refresh(cid, mid)
+        finally:
+            if _av_live.get((cid, mid)) == tok:
+                _av_live.pop((cid, mid), None)
+    threading.Thread(target=_loop, daemon=True).start()
 
 
 # ── MCP manager (self-contained; mekanisme sama dgn terminal) ────────────────
@@ -2014,6 +2067,55 @@ def _tool_line(name: str, inp: dict):
         return ("bash", cmd[:280]) if cmd else ("label", "💻 terminal")
     return ("label", _tool_label(name, inp))
 
+# ── Pelacak aktivitas per window (bahan panel /agents LIVE) ──────────────────
+# Diisi dari wrapper on_event di run_claude: aktivitas terkini (tool/mikir/
+# nulis), subagent Task yang di-spawn + status selesai, dan waktu mulai turn.
+_ACT: dict = {}   # lock_key (cid, win) -> {start, at, label, agents{id:{...}}}
+
+def _fmt_dur(s) -> str:
+    s = max(0, int(s))
+    return f"{s//60}m{s%60:02d}s" if s >= 60 else f"{s}s"
+
+def _act_track(lock_key, ev: dict):
+    """Update _ACT dari satu event stream — dipanggil tiap event saat turn
+    berjalan. Murah (dict ops saja), aman dipanggil dari thread reader."""
+    ent = _ACT.get(lock_key)
+    if ent is None:
+        return
+    t = ev.get("type")
+    now = time.time()
+    if t == "stream_think":
+        ent["label"] = "🧠 berpikir…"
+    elif t == "stream_text" and ev.get("text"):
+        ent["label"] = "💬 menulis jawaban…"
+    elif t == "assistant":
+        for b in ev.get("message", {}).get("content", []) or []:
+            if not isinstance(b, dict) or b.get("type") != "tool_use":
+                continue
+            name = (b.get("name") or "")
+            inp = b.get("input") or {}
+            if name.lower() == "task":
+                aid = b.get("id") or uuid.uuid4().hex[:6]
+                desc = (inp.get("description")
+                        or (inp.get("prompt") or "")[:40] or "subagent")
+                ent["agents"][aid] = {"desc": desc[:60],
+                                      "type": inp.get("subagent_type") or "",
+                                      "since": now, "done": False, "dur": 0}
+                while len(ent["agents"]) > 8:
+                    ent["agents"].pop(next(iter(ent["agents"])))
+                ent["label"] = f"🤖 delegasi ke subagent: {desc[:34]}"
+            else:
+                ent["label"] = _tool_label(name, inp)
+    elif t == "user":
+        # tool_result Task balik = subagent kelar
+        for b in ev.get("message", {}).get("content", []) or []:
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                a = ent["agents"].get(b.get("tool_use_id"))
+                if a and not a["done"]:
+                    a["done"] = True
+                    a["dur"] = now - a["since"]
+    ent["at"] = now
+
 # ── Warm pool: proses `claude` PERSISTENT per sesi ───────────────────────────
 # Tiap pesan yang spawn proses baru bayar startup penuh (load MCP + CLAUDE.md
 # + tool discovery ≈ 3-9 dtk). Dengan --input-format stream-json prosesnya
@@ -2378,6 +2480,11 @@ def run_claude(prompt: str, chat_id: int, workdir: str, session_id: str,
     # ⚡ Ukur first-token latency (muncul di journal — bukti cepat/lambat nyata)
     _t0 = time.time()
     _ft = {"seen": False, "path": "cold"}
+    if lock_key is not None:
+        # daftar aktivitas utk panel /agents live
+        _ACT[lock_key] = {"start": _t0, "at": _t0,
+                          "label": "🚀 menyiapkan…", "agents": {}}
+        _cap_pending(_ACT, 100)
     _user_ev = on_event
     def on_event(e, __oe=_user_ev):
         if (not _ft["seen"]) and (
@@ -2385,6 +2492,11 @@ def run_claude(prompt: str, chat_id: int, workdir: str, session_id: str,
                 or e.get("type") == "assistant"):
             _ft["seen"] = True
             log(f"⚡ first-token {time.time()-_t0:.1f}s ({_ft['path']}) sesi {session_id[:8]}")
+        if lock_key is not None:
+            try:
+                _act_track(lock_key, e)
+            except Exception:
+                pass
         if __oe:
             __oe(e)
 
@@ -2886,10 +2998,12 @@ def handle_callback(cb: dict):
             _agentview_refresh(cid, mid)
         elif sub == "rf":
             _agentview_refresh(cid, mid)
+        _agentview_autorefresh(cid, mid)   # panel LIVE selama ada yang kerja
         return
 
     # ── Panel MCP: on/off server / cek ulang ────────────────────────────────
     if data.startswith("mcp:"):
+        _av_live.pop((cid, mid), None)     # panel ini bukan Agent View lagi
         sub = data[4:]
         if sub in ("open", "hard"):
             # health-check bisa ±10 dtk → kasih tanda loading dulu
@@ -3662,6 +3776,7 @@ def handle_callback(cb: dict):
         edit_md(cid, mid, "⚡ **Aksi cepat** — pilih di bawah:", reply_markup=MENU_KB)
     elif data in ("m_close", "close"):
         # Universal "tutup" — hapus pesan menu biar chat bersih
+        _av_live.pop((cid, mid), None)   # stop auto-refresh Agent View
         try:
             tg_api("deleteMessage", chat_id=cid, message_id=mid)
         except Exception:
@@ -4567,11 +4682,13 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
         if thread_id:
             kw["message_thread_id"] = thread_id
         try:
-            tg_api("sendMessage", **kw)
+            d = tg_api("sendMessage", **kw)
         except Exception:
             kw["text"] = re.sub(r'\\([_*\[\]()~`>#+\-=|{}.!\\])', r'\1', kw["text"])[:4096]
             kw.pop("parse_mode", None)
-            tg_api("sendMessage", **kw)
+            d = tg_api("sendMessage", **kw)
+        # panel LIVE: update sendiri selama ada task jalan
+        _agentview_autorefresh(cid, (d.get("result") or {}).get("message_id") or 0)
         return None
     if c == "/restart":
         send_msg(cid, "♻️ Merestart bot… (auto-up via systemd, ~5 detik)")
