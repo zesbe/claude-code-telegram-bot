@@ -91,6 +91,25 @@ TELE_SYSTEM_PROMPT = CFG.get("system_prompt", (
     "lalu tekan tombol ✅ Selesai untuk konfirmasi. Maksimal 8 opsi. "
     "Kalau ragu antara PICK/MULTIPICK dan pertanyaannya soal 'pilih fitur/scope', "
     "pilih MULTIPICK.\n\n"
+    "FORM MULTI-PERTANYAAN: kalau kamu perlu menanyakan BEBERAPA hal sekaligus "
+    "(wizard/setup, mis. 'game apa + perangkat mana + fallback gimana'), JANGAN "
+    "kirim pertanyaan satu-satu — pakai SATU blok FORM (bot merender wizard "
+    "bertahap dengan navigasi ⬅️ ➡️ + tombol ✅ Kirim, persis AskUserQuestion "
+    "di terminal):\n"
+    "[[FORM]]\n"
+    "[Q:multi] Game apa saja yang mau diarahkan ke ISP2?\n"
+    "1. Mobile Legends\n"
+    "2. Free Fire\n"
+    "3. PUBG Mobile\n"
+    "[Q:single] Aturan berlaku untuk perangkat mana?\n"
+    "1. Semua perangkat LAN\n"
+    "2. Device tertentu saja\n"
+    "[[/FORM]]\n"
+    "Aturan FORM: maksimal 4 pertanyaan × 8 opsi; [Q:single]=pilih satu, "
+    "[Q:multi]=boleh banyak; pertanyaan singkat & opsi maks ~50 char; taruh blok "
+    "di AKHIR pesan, penjelasan sebelumnya. User juga bisa MENGETIK jawaban bebas "
+    "per pertanyaan (tombol ✍️), jadi tak perlu opsi 'lainnya'. "
+    "Kalau cuma SATU pertanyaan → tetap pakai PICK/MULTIPICK biasa.\n\n"
     "PRESENTASI — data terstruktur: untuk perbandingan/daftar berkolom/rekap/angka, "
     "GUNAKAN tabel markdown (| kolom | kolom | lalu baris pemisah |---|). Bot "
     "merender tabel otomatis jadi kotak rapi (monospace) di Telegram. Beri baris "
@@ -1080,9 +1099,127 @@ def _parse_multipick(text: str):
     clean = (text[:m.start()] + text[m.end():]).strip()
     return clean, (options[:8] or None)
 
+# ── FORM multi-pertanyaan (wizard ala AskUserQuestion di terminal) ───────────
+# Claude emit [[FORM]] [Q:multi] tanya? \n 1. opsi … [[/FORM]] → bot render
+# wizard 1 pesan: pertanyaan tampil satu-satu, ⬅️ ➡️ navigasi, ☐/☑ toggle,
+# ✍️ jawab ketik, ✅ Kirim menyusun semua jawaban jadi satu pesan balik.
+_FORM_RE = re.compile(r"\[\[FORM\]\](.*?)\[\[/FORM\]\]", re.DOTALL | re.IGNORECASE)
+_pending_form: dict = {}   # (cid, tok) -> state wizard
+_form_await: dict = {}     # cid -> (tok, mid): nunggu jawaban KETIK utk form
+
+def _parse_form(text: str):
+    """Return (clean_text, questions|None); questions=[{q,multi,opts}] maks 4×8."""
+    m = _FORM_RE.search(text or "")
+    if not m:
+        return text, None
+    qs, cur = [], None
+    for line in m.group(1).splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        qm = re.match(r"^\[Q(?::(single|multi))?\]\s*(.+)$", line, re.IGNORECASE)
+        if qm:
+            if cur and cur["opts"]:
+                qs.append(cur)
+            cur = {"q": qm.group(2).strip()[:200],
+                   "multi": (qm.group(1) or "single").lower() == "multi",
+                   "opts": []}
+            continue
+        if cur is None:
+            continue
+        opt = re.sub(r"^\s*(?:\d+[.)]|[-*])\s*", "", line).strip()
+        if opt and len(cur["opts"]) < 8:
+            cur["opts"].append(opt[:60])
+    if cur and cur["opts"]:
+        qs.append(cur)
+    clean = (text[:m.start()] + text[m.end():]).strip()
+    return clean, (qs[:4] or None)
+
+def _form_answer_of(st: dict, i: int):
+    """Jawaban pertanyaan ke-i sebagai teks; None kalau belum dijawab."""
+    if st["typed"][i]:
+        return st["typed"][i]
+    if st["sel"][i]:
+        return ", ".join(st["qs"][i]["opts"][j] for j in sorted(st["sel"][i]))
+    return None
+
+def _form_text(st: dict) -> str:
+    i, n = st["idx"], len(st["qs"])
+    q = st["qs"][i]
+    lines = []
+    if st.get("intro"):
+        lines += [st["intro"], ""]
+    done = sum(1 for k in range(n) if _form_answer_of(st, k))
+    lines.append(f"📋 *Pertanyaan {i+1}/{n}* — {done}/{n} terjawab")
+    lines.append(f"\n*{q['q']}*")
+    lines.append("_boleh pilih lebih dari satu_" if q["multi"]
+                 else "_pilih salah satu_")
+    answered = [f"✔ {st['qs'][k]['q'][:34]} → *{_form_answer_of(st, k)[:42]}*"
+                for k in range(n) if k != i and _form_answer_of(st, k)]
+    if answered:
+        lines.append("")
+        lines += answered
+    return "\n".join(lines)
+
+def _form_kb(tok: str, st: dict) -> dict:
+    i, n = st["idx"], len(st["qs"])
+    q = st["qs"][i]
+    rows = []
+    for oi, opt in enumerate(q["opts"]):
+        on = oi in st["sel"][i]
+        pre = ("☑" if on else "☐") if q["multi"] else ("🔘" if on else "⚪")
+        rows.append([{"text": f"{pre} {opt[:36]}",
+                      "callback_data": f"fm:t:{tok}:{i}:{oi}"}])
+    nav = []
+    if i > 0:
+        nav.append({"text": "⬅️ Kembali", "callback_data": f"fm:p:{tok}"})
+    if i < n - 1:
+        nav.append({"text": "➡️ Lanjut", "callback_data": f"fm:n:{tok}"})
+    nav.append({"text": "✅ Kirim", "callback_data": f"fm:s:{tok}"})
+    rows.append(nav)
+    rows.append([
+        {"text": "✍️ Ketik jawaban", "callback_data": f"fm:w:{tok}"},
+        {"text": "💬 Bahas dulu", "callback_data": f"fm:c:{tok}"},
+    ])
+    return {"inline_keyboard": rows}
+
+def _form_render(cid: int, mid: int, tok: str):
+    st = _pending_form.get((cid, tok))
+    if not st:
+        return
+    try:
+        tg_api("editMessageText", chat_id=cid, message_id=mid,
+               text=_to_md(_form_text(st)), parse_mode="MarkdownV2",
+               reply_markup=_form_kb(tok, st))
+    except Exception:
+        pass
+
 def send_with_pick(chat_id: int, text: str, reply_to: int = 0, thread_id: int = 0) -> bool:
-    """If text has a PICK/MULTIPICK block, send text + inline option buttons.
+    """If text has a FORM/PICK/MULTIPICK block, send text + inline buttons.
     Returns True if a pick was rendered (caller should NOT also send the raw text)."""
+
+    # FORM multi-pertanyaan lebih dulu (wizard bertahap)
+    clean_f, form_qs = _parse_form(text)
+    if form_qs:
+        tok = uuid.uuid4().hex[:8]
+        st = {"qs": form_qs, "sel": [set() for _ in form_qs],
+              "typed": [None] * len(form_qs), "idx": 0,
+              "intro": (clean_f or "").strip()[:1500]}
+        _pending_form[(chat_id, tok)] = st
+        _cap_pending(_pending_form)
+        kw = {"chat_id": chat_id, "text": _to_md(_form_text(st)),
+              "parse_mode": "MarkdownV2", "reply_markup": _form_kb(tok, st)}
+        if thread_id:
+            kw["message_thread_id"] = thread_id
+        if reply_to:
+            kw["reply_to_message_id"] = reply_to
+        try:
+            tg_api("sendMessage", **kw)
+        except Exception:
+            kw["text"] = re.sub(r'\\([_*\[\]()~`>#+\-=|{}.!\\])', r'\1', kw["text"])[:4096]
+            kw.pop("parse_mode", None)
+            tg_api("sendMessage", **kw)
+        return True
 
     # Check MULTIPICK first (multi-select with toggle + confirm button)
     clean_mp, mp_options = _parse_multipick(text)
@@ -1475,17 +1612,24 @@ def _mcp_disabled(project: str) -> set:
     except Exception:
         return set()
 
-def _mcp_enabled_names(project: str) -> set:
-    """Server .mcp.json yang DINYALAKAN user utk project ini (enabled minus
-    disabled). Ini yang benar-benar dimuat bot via --mcp-config."""
+def _mcp_missing_env(name: str) -> list:
+    """Var ${...} yang direferensikan config server tapi kosong di env bot.
+    Server begini PASTI gagal start → tidak ikut dimuat, panel kasih 🟠."""
     try:
-        data = json.loads((Path.home() / ".claude.json").read_text(encoding="utf-8"))
-        proj = (data.get("projects") or {}).get(project, {})
-        en = set(proj.get("enabledMcpjsonServers", []))
-        dis = set(proj.get("disabledMcpjsonServers", []))
-        return (en - dis) & _mcp_json_names()
+        data = json.loads((Path.home() / ".mcp.json").read_text(encoding="utf-8"))
+        cfg = (data.get("mcpServers") or {}).get(name) or {}
+        refs = set(re.findall(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", json.dumps(cfg)))
+        return sorted(v for v in refs if not os.environ.get(v))
     except Exception:
-        return set()
+        return []
+
+def _mcp_enabled_names(project: str) -> set:
+    """Server .mcp.json yang dimuat bot utk project ini. DEFAULT: NYALA SEMUA
+    (permintaan user 2026-07-11 — 'MCP selalu nyala') KECUALI:
+    (a) dimatikan manual via /mcp (disabledMcpjsonServers), atau
+    (b) API key ${VAR}-nya belum diisi (pasti gagal start)."""
+    names = _mcp_json_names() - _mcp_disabled(project)
+    return {n for n in names if not _mcp_missing_env(n)}
 
 _MCP_CFG_CACHE = {"key": None, "path": None}
 
@@ -1590,11 +1734,17 @@ def _mcp_panel_text(cid: int) -> str:
 
     # ── Bagian 1: server project (.mcp.json) — bisa di-on/off dari sini ──
     names = sorted(_mcp_json_names())
+    dis = _mcp_disabled(project)
     if names:
-        lines.append(f"*Punya project* — {len(enabled)}/{len(names)} nyala:")
+        lines.append(f"*Punya project* — {len(enabled)}/{len(names)} nyala "
+                     f"(default semua nyala):")
         for n in names:
-            if n not in enabled:
-                lines.append(f"⚫ *{n}* — mati")
+            miss = _mcp_missing_env(n)
+            if n in dis:
+                lines.append(f"⚫ *{n}* — kamu matikan")
+            elif miss:
+                lines.append(f"🟠 *{n}* — butuh API key `{', '.join(miss)}` "
+                             f"(isi di .mcp.json)")
             elif sess_state.get(n) == "connected":
                 lines.append(f"🟢 *{n}* — nyala · nyambung")
             elif sess_state.get(n) == "failed":
@@ -1617,20 +1767,23 @@ def _mcp_panel_text(cid: int) -> str:
             else:
                 lines.append(f"⚪ {s['name']} — {s['status'][:40]}")
 
-    lines.append("\n💡 *Cara pakai:* tap tombol server = nyalakan (▶️) / "
-                 "matikan (⏸). Langsung dipakai pesan berikutnya.")
+    lines.append("\n💡 *Cara pakai:* semua server nyala otomatis. Tap ⏸ utk "
+                 "matikan / ▶️ utk nyalakan lagi — langsung dipakai pesan "
+                 "berikutnya.")
     lines.append("_Makin banyak yang nyala = start sesi makin berat — "
-                 "nyalakan yang perlu saja._")
+                 "matikan yang tak dipakai biar ngebut._")
     return "\n".join(lines)
 
 def _mcp_panel_kb(cid: int) -> dict:
     project = load_sess(cid).get("workdir", WORKDIR)
-    enabled = _mcp_enabled_names(project)
+    dis = _mcp_disabled(project)
     rows, pair = [], []
     for name in sorted(_mcp_json_names()):
         if not _MCP_NAME_RE.fullmatch(name):
             continue
-        on = name in enabled
+        if _mcp_missing_env(name):
+            continue   # tanpa API key gak bisa nyala — tampil 🟠 di teks saja
+        on = name not in dis
         label = f"{'⏸' if on else '▶️'} {name[:24]}"
         pair.append({"text": label, "callback_data": f"mcp:t:{name[:40]}"})
         if len(pair) == 2:
@@ -2751,7 +2904,8 @@ def handle_callback(cb: dict):
             name = sub[2:]
             project = load_sess(cid).get("workdir", WORKDIR)
             if name in _mcp_json_names() and _MCP_NAME_RE.fullmatch(name):
-                turn_on = name not in _mcp_enabled_names(project)
+                # default nyala → ON kalau lagi ada di daftar disabled
+                turn_on = name in _mcp_disabled(project)
                 ok = _mcp_toggle(name, enabled=turn_on, project=project)
                 if ok:
                     # proses warm masih bawa set MCP lama → buang; respawn
@@ -2787,6 +2941,94 @@ def handle_callback(cb: dict):
         return
 
     # MULTIPICK: toggle an option on/off
+    # ── FORM wizard: toggle opsi / navigasi / ketik / kirim ──────────────────
+    if data.startswith("fm:"):
+        parts = data.split(":")
+        act = parts[1] if len(parts) > 1 else ""
+        tok = parts[2] if len(parts) > 2 else ""
+        st = _pending_form.get((cid, tok))
+        if not st:
+            try:
+                tg_api("editMessageReplyMarkup", chat_id=cid, message_id=mid,
+                       reply_markup={"inline_keyboard": []})
+                tg_api("sendMessage", chat_id=cid, parse_mode="",
+                       text="⌛ Form kadaluarsa (bot sempat restart). Ketik jawabannya manual ya.")
+            except Exception:
+                pass
+            return
+        n = len(st["qs"])
+        if act == "t" and len(parts) == 5:
+            try:
+                qi, oi = int(parts[3]), int(parts[4])
+            except ValueError:
+                return
+            if 0 <= qi < n and 0 <= oi < len(st["qs"][qi]["opts"]):
+                if st["qs"][qi]["multi"]:
+                    if oi in st["sel"][qi]:
+                        st["sel"][qi].discard(oi)
+                    else:
+                        st["sel"][qi].add(oi)
+                else:
+                    st["sel"][qi] = {oi}
+                    st["typed"][qi] = None
+                    if qi < n - 1:
+                        st["idx"] = qi + 1   # pilih-satu → otomatis lanjut
+            _form_render(cid, mid, tok)
+        elif act == "p":
+            st["idx"] = max(0, st["idx"] - 1)
+            _form_render(cid, mid, tok)
+        elif act == "n":
+            st["idx"] = min(n - 1, st["idx"] + 1)
+            _form_render(cid, mid, tok)
+        elif act == "w":
+            _form_await[cid] = (tok, mid)
+            try:
+                tg_api("answerCallbackQuery", callback_query_id=cb_id,
+                       text=f"Ketik jawabanmu utk pertanyaan {st['idx']+1} — "
+                            f"pesan teks berikutnya masuk ke form.",
+                       show_alert=True)
+            except Exception:
+                pass
+        elif act == "c":
+            try:
+                tg_api("answerCallbackQuery", callback_query_id=cb_id,
+                       text="Silakan ketik pertanyaan/diskusimu ke Claude — "
+                            "form ini tetap bisa diisi setelahnya.",
+                       show_alert=True)
+            except Exception:
+                pass
+        elif act == "s":
+            blank = [k for k in range(n) if not _form_answer_of(st, k)]
+            if blank:
+                st["idx"] = blank[0]
+                _form_render(cid, mid, tok)
+                try:
+                    tg_api("answerCallbackQuery", callback_query_id=cb_id,
+                           text=f"Masih {len(blank)} pertanyaan belum dijawab.",
+                           show_alert=True)
+                except Exception:
+                    pass
+                return
+            _pending_form.pop((cid, tok), None)
+            _form_await.pop(cid, None)
+            rows = [f"• {st['qs'][k]['q']} → {_form_answer_of(st, k)}"
+                    for k in range(n)]
+            thread_id = cb["message"].get("message_thread_id", 0)
+            try:
+                tg_api("editMessageText", chat_id=cid, message_id=mid,
+                       text=_to_md("✅ *Form terkirim:*\n" + "\n".join(rows)),
+                       parse_mode="MarkdownV2")
+            except Exception:
+                pass
+            synth = {"message": {"chat": {"id": cid, "type": cb["message"]["chat"].get("type", "private")},
+                                 "from": {"id": uid}, "message_id": mid,
+                                 "text": "Jawaban form:\n" + "\n".join(rows)}}
+            if thread_id:
+                synth["message"]["message_thread_id"] = thread_id
+            import threading as _t
+            _t.Thread(target=_process_safe, args=(synth,), daemon=True).start()
+        return
+
     if data.startswith("mpick:"):
         try:
             _, tok, idx_s = data.split(":", 2)
@@ -4723,7 +4965,8 @@ class LiveStream:
         """Preview live dipotong di tag PICK/MULTIPICK — tag mentah jangan
         pernah tampil ke user; blok pilihan dirender caller via tombol."""
         up = (t or "").upper()
-        cuts = [i for i in (up.find("[[PICK"), up.find("[[MULTIPICK")) if i >= 0]
+        cuts = [i for i in (up.find("[[PICK"), up.find("[[MULTIPICK"),
+                            up.find("[[FORM")) if i >= 0]
         return t[:min(cuts)] if cuts else t
 
     def _seg_loop(self):
@@ -5196,6 +5439,21 @@ def process(upd: dict):
             pass
         log(f"BLOCKED uid={uid}")
         return
+
+    # Form wizard: user tadi tap "✍️ Ketik jawaban" → pesan teks ini masuk
+    # sebagai jawaban pertanyaan aktif form, BUKAN dikirim ke Claude.
+    if text and not text.startswith("/") and cid in _form_await:
+        f_tok, f_mid = _form_await.pop(cid)
+        f_st = _pending_form.get((cid, f_tok))
+        if f_st:
+            f_st["typed"][f_st["idx"]] = text.strip()[:300]
+            f_st["sel"][f_st["idx"]] = set()
+            if f_st["idx"] < len(f_st["qs"]) - 1:
+                f_st["idx"] += 1
+            _form_render(cid, f_mid, f_tok)
+            send_msg(cid, "✍️ Masuk ke form. Lanjut isi, atau tekan ✅ Kirim.",
+                     thread_id=thread_id or None)
+            return
 
     # Photo / document → download to workdir, niru drag-drop terminal (#4).
     # Album (banyak foto) di-buffer dulu lewat media_group_id biar 1 run, bukan
