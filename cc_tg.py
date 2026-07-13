@@ -47,6 +47,36 @@ def _find_claude_bin() -> str:
             return str(c)
     return cfg_bin or "claude"   # last resort: lewat PATH saat dipanggil
 
+def _load_claude_env() -> list:
+    """Muat ~/.claude/.env ke os.environ — di situlah API key MCP disimpan
+    (CONTEXT7/EXA/Z_AI/MINIMAX…). Tanpa ini `${VAR}` di .mcp.json tak pernah
+    ter-resolve → server MCP-nya gagal start di sesi bot (systemd unit tak
+    baca shell profile). Var yang SUDAH ada di environ TIDAK ditimpa.
+    Return: daftar NAMA var yang dimuat (nilai tak pernah di-log)."""
+    f = _claude_home() / ".env"
+    if not f.exists():
+        return []
+    loaded = []
+    try:
+        for ln in f.read_text(encoding="utf-8").splitlines():
+            ln = ln.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            m = re.match(r"(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)", ln)
+            if not m:
+                continue
+            k, v = m.group(1), m.group(2).strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+                v = v[1:-1]
+            if v and not os.environ.get(k):
+                os.environ[k] = v
+                loaded.append(k)
+    except Exception:
+        return loaded
+    return loaded
+
+_ENV_LOADED = _load_claude_env()
+
 TG_TOKEN    = CFG["telegram_token"]
 OWNER_IDS   = set(CFG.get("owner_ids", []))
 CLAUDE_BIN  = _find_claude_bin()
@@ -1654,21 +1684,24 @@ _MCP_NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,60}$")
 _MCP_CACHE = {"at": 0.0, "servers": None}   # cache 60 dtk (health-check ±10 dtk)
 
 def _mcp_json_names() -> set:
-    """Nama server di ~/.mcp.json — cuma ini yang bisa di-on/off dari bot
-    (connector claude.ai & server plugin dikelola di tempat lain)."""
+    """KATALOG server di ~/.mcp.json — daftar yang bisa di-on/off dari bot
+    (connector claude.ai & server plugin dikelola di tempat lain).
+    CATATAN 2026-07-13: .mcp.json (project scope) TIDAK pernah diaktifkan
+    Claude Code di home dir — dia cuma jadi katalog. Yang benar-benar dimuat
+    (terminal DAN bot) = USER SCOPE: `mcpServers` di ~/.claude.json."""
     try:
         data = json.loads((Path.home() / ".mcp.json").read_text(encoding="utf-8"))
         return set((data.get("mcpServers") or {}).keys())
     except Exception:
         return set()
 
-def _mcp_disabled(project: str) -> set:
+def _mcp_user_scope() -> dict:
+    """Server user-scope di ~/.claude.json — INI yang dimuat semua sesi."""
     try:
         data = json.loads((Path.home() / ".claude.json").read_text(encoding="utf-8"))
-        proj = (data.get("projects") or {}).get(project, {})
-        return set(proj.get("disabledMcpjsonServers", []))
+        return data.get("mcpServers") or {}
     except Exception:
-        return set()
+        return {}
 
 def _mcp_missing_env(name: str) -> list:
     """Var ${...} yang direferensikan config server tapi kosong di env bot.
@@ -1681,46 +1714,16 @@ def _mcp_missing_env(name: str) -> list:
     except Exception:
         return []
 
-def _mcp_enabled_names(project: str) -> set:
-    """Server .mcp.json yang dimuat bot utk project ini. DEFAULT: NYALA SEMUA
-    (permintaan user 2026-07-11 — 'MCP selalu nyala') KECUALI:
-    (a) dimatikan manual via /mcp (disabledMcpjsonServers), atau
-    (b) API key ${VAR}-nya belum diisi (pasti gagal start)."""
-    names = _mcp_json_names() - _mcp_disabled(project)
-    return {n for n in names if not _mcp_missing_env(n)}
+def _mcp_enabled_names(project: str = "") -> set:
+    """Server katalog yang AKTIF = yang ada di user-scope ~/.claude.json.
+    Dimuat otomatis oleh SEMUA sesi (terminal & bot) tanpa flag apa pun —
+    makanya bot tak perlu --mcp-config lagi."""
+    return _mcp_json_names() & set(_mcp_user_scope().keys())
 
-_MCP_CFG_CACHE = {"key": None, "path": None}
-
-def _mcp_config_args(project: str) -> list:
-    """Args `--mcp-config <file>` berisi HANYA server .mcp.json yang di-enable
-    via /mcp. PENTING: mode -p TIDAK memuat .mcp.json otomatis (terbukti probe
-    2026-07-11 — enabledMcpjsonServers & enableAllProjectMcpServers diabaikan
-    di print mode), jadi bot suntik file konfig tersaring eksplisit.
-    File bisa berisi env/token → mode 600, jangan pernah di-log isinya."""
-    names = sorted(_mcp_enabled_names(project))
-    if not names:
-        return []
-    try:
-        src = json.loads((Path.home() / ".mcp.json").read_text(encoding="utf-8"))
-        allsrv = src.get("mcpServers") or {}
-        servers = {n: allsrv[n] for n in names if n in allsrv}
-    except Exception:
-        return []
-    if not servers:
-        return []
-    key = json.dumps(servers, sort_keys=True)
-    if (_MCP_CFG_CACHE["key"] == key and _MCP_CFG_CACHE["path"]
-            and Path(_MCP_CFG_CACHE["path"]).exists()):
-        return ["--mcp-config", _MCP_CFG_CACHE["path"]]
-    path = BOT_DIR / "mcp-enabled.json"
-    path.write_text(json.dumps({"mcpServers": servers}, indent=2),
-                    encoding="utf-8")
-    try:
-        path.chmod(0o600)
-    except Exception:
-        pass
-    _MCP_CFG_CACHE.update(key=key, path=str(path))
-    return ["--mcp-config", str(path)]
+def _mcp_extra_names() -> set:
+    """Server user-scope DI LUAR katalog (mis. serena, telegram) — bawaan,
+    tidak diutak-atik bot (permintaan user: 'MCP bawaan Claude biarin')."""
+    return set(_mcp_user_scope().keys()) - _mcp_json_names()
 
 def _mcp_servers(force: bool = False) -> list:
     """Jalankan `claude mcp list` + parse. Hasil di-cache 60 dtk supaya tombol
@@ -1750,25 +1753,30 @@ def _mcp_servers(force: bool = False) -> list:
     _MCP_CACHE.update(at=now, servers=servers)
     return servers
 
-def _mcp_toggle(name: str, enabled: bool, project: str) -> bool:
-    """Nyalakan/matikan server utk project ini — file & field sama persis
-    dgn Claude Code asli. Return False kalau gagal baca/tulis."""
+def _mcp_toggle(name: str, enabled: bool, project: str = "") -> bool:
+    """Nyalakan/matikan server DI USER SCOPE (~/.claude.json `mcpServers`) —
+    satu-satunya scope yang benar-benar dimuat Claude Code di sini. Efeknya
+    kena SEMUA sesi: bot DAN terminal (sesi yang sudah jalan perlu restart).
+    Nyala  = salin definisi dari katalog ~/.mcp.json ke user-scope.
+    Mati   = buang dari user-scope (definisi tetap aman di katalog).
+    Backup + tulis atomic. Return False kalau gagal."""
     cj = Path.home() / ".claude.json"
     try:
         data = json.loads(cj.read_text(encoding="utf-8")) if cj.exists() else {}
+        catalog = json.loads(
+            (Path.home() / ".mcp.json").read_text(encoding="utf-8"))
+        catalog = catalog.get("mcpServers") or {}
     except Exception:
         return False
     if not isinstance(data, dict):
         return False
-    proj = data.setdefault("projects", {}).setdefault(project, {})
-    en = set(proj.get("enabledMcpjsonServers", []))
-    dis = set(proj.get("disabledMcpjsonServers", []))
+    srv = data.setdefault("mcpServers", {})
     if enabled:
-        dis.discard(name); en.add(name)
+        if name not in catalog:
+            return False
+        srv[name] = catalog[name]      # definisi apa adanya (${VAR}, bukan nilai)
     else:
-        en.discard(name); dis.add(name)
-    proj["enabledMcpjsonServers"] = sorted(en)
-    proj["disabledMcpjsonServers"] = sorted(dis)
+        srv.pop(name, None)
     try:
         (cj.parent / f".claude.json.bak.{int(time.time())}").write_text(
             cj.read_text(encoding="utf-8"), encoding="utf-8")
@@ -1784,64 +1792,50 @@ def _mcp_toggle(name: str, enabled: bool, project: str) -> bool:
         return False
 
 def _mcp_panel_text(cid: int) -> str:
-    project = load_sess(cid).get("workdir", WORKDIR)
-    enabled = _mcp_enabled_names(project)
+    enabled = _mcp_enabled_names()
     sess_state = _MCP_SESSION_STATE["servers"]
-    lines = ["🔌 *MCP Servers*",
-             f"📂 Project: `{project.replace(str(Path.home()), '~')}`\n"]
-
-    # ── Bagian 1: server project (.mcp.json) — bisa di-on/off dari sini ──
     names = sorted(_mcp_json_names())
-    dis = _mcp_disabled(project)
-    if names:
-        lines.append(f"*Punya project* — {len(enabled)}/{len(names)} nyala "
-                     f"(default semua nyala):")
-        for n in names:
-            miss = _mcp_missing_env(n)
-            if n in dis:
-                lines.append(f"⚫ *{n}* — kamu matikan")
-            elif miss:
-                lines.append(f"🟠 *{n}* — butuh API key `{', '.join(miss)}` "
-                             f"(isi di .mcp.json)")
-            elif sess_state.get(n) == "connected":
-                lines.append(f"🟢 *{n}* — nyala · nyambung")
-            elif sess_state.get(n) == "failed":
-                lines.append(f"🔴 *{n}* — nyala tapi gagal konek")
-            else:
-                lines.append(f"🔵 *{n}* — nyala (dimuat di pesan berikutnya)")
-        lines.append("")
+    lines = [f"🔌 *MCP Servers* — {len(enabled)}/{len(names)} nyala",
+             "_Berlaku di bot **dan** terminal (satu pengaturan)._\n"]
 
-    # ── Bagian 2: bawaan akun/plugin — kelola di terminal / claude.ai ──
-    others = _mcp_servers()
+    for n in names:
+        miss = _mcp_missing_env(n)
+        if n not in enabled:
+            lines.append(f"⚫ *{n}* — mati")
+        elif miss:
+            lines.append(f"🟠 *{n}* — butuh API key `{', '.join(miss)}`")
+        elif sess_state.get(n) in ("connected", "pending"):
+            lines.append(f"🟢 *{n}* — nyala")
+        elif sess_state.get(n) == "failed":
+            lines.append(f"🔴 *{n}* — gagal konek")
+        else:
+            lines.append(f"🔵 *{n}* — nyala (aktif di pesan berikutnya)")
+
+    extra = sorted(_mcp_extra_names())
+    if extra:
+        lines.append(f"\n*Bawaan* (tak diutak-atik bot): "
+                     f"{', '.join(f'`{e}`' for e in extra)}")
+    others = [s for s in _mcp_servers()
+              if s["name"] not in _mcp_user_scope()]
     if others:
-        lines.append("*Bawaan akun/plugin* (kelola di terminal):")
-        for s in others:
-            if s["icon"] == "✔":
-                lines.append(f"🟢 {s['name']} — nyambung")
-            elif s["icon"] == "✘":
-                lines.append(f"🔴 {s['name']} — gagal konek")
-            elif s["icon"] == "!":
-                lines.append(f"🟡 {s['name']} — perlu login")
-            else:
-                lines.append(f"⚪ {s['name']} — {s['status'][:40]}")
+        ok = sum(1 for s in others if s["icon"] == "✔")
+        lines.append(f"*Connector/plugin akun:* {ok}/{len(others)} nyambung "
+                     f"(kelola di claude.ai / terminal)")
 
-    lines.append("\n💡 *Cara pakai:* semua server nyala otomatis. Tap ⏸ utk "
-                 "matikan / ▶️ utk nyalakan lagi — langsung dipakai pesan "
-                 "berikutnya.")
-    lines.append("_Makin banyak yang nyala = start sesi makin berat — "
-                 "matikan yang tak dipakai biar ngebut._")
+    lines.append("\n💡 *Cara pakai:* tap ⏸ utk matikan · ▶️ utk nyalakan. "
+                 "Bot langsung ikut; sesi terminal yang lagi buka perlu "
+                 "dijalankan ulang.")
+    lines.append("_Makin banyak nyala = start sesi makin berat — matikan yang "
+                 "tak dipakai biar ngebut._")
     return "\n".join(lines)
 
 def _mcp_panel_kb(cid: int) -> dict:
-    project = load_sess(cid).get("workdir", WORKDIR)
-    dis = _mcp_disabled(project)
+    enabled = _mcp_enabled_names()
     rows, pair = [], []
     for name in sorted(_mcp_json_names()):
         if not _MCP_NAME_RE.fullmatch(name):
             continue
-        if _mcp_missing_env(name):
-            continue   # tanpa API key gak bisa nyala — tampil 🟠 di teks saja
-        on = name not in dis
+        on = name in enabled
         label = f"{'⏸' if on else '▶️'} {name[:24]}"
         pair.append({"text": label, "callback_data": f"mcp:t:{name[:40]}"})
         if len(pair) == 2:
@@ -2261,7 +2255,6 @@ class _WarmProc:
                "--append-system-prompt", TELE_SYSTEM_PROMPT]
         if self.effort and self.effort in EFFORT_LEVELS:
             cmd += ["--effort", self.effort]
-        cmd += _mcp_config_args(self.workdir)   # MCP yang di-enable via /mcp
         cmd.append("--dangerously-skip-permissions")
         # stderr → DEVNULL: kalau turn warm gagal, fallback cold yang
         # nangkep detail errornya. start_new_session → kill 1 pohon (MCP dkk).
@@ -2557,7 +2550,6 @@ def run_claude(prompt: str, chat_id: int, workdir: str, session_id: str,
                 "--append-system-prompt", TELE_SYSTEM_PROMPT]
         if effort and effort in EFFORT_LEVELS:
             base += ["--effort", effort]
-        base += _mcp_config_args(workdir)   # MCP yang di-enable via /mcp
         base += ["--dangerously-skip-permissions", prompt]
         return base
 
@@ -3021,15 +3013,13 @@ def handle_callback(cb: dict):
             _mcp_panel_refresh(cid, mid)
         elif sub.startswith("t:"):
             name = sub[2:]
-            project = load_sess(cid).get("workdir", WORKDIR)
             if name in _mcp_json_names() and _MCP_NAME_RE.fullmatch(name):
-                # default nyala → ON kalau lagi ada di daftar disabled
-                turn_on = name in _mcp_disabled(project)
-                ok = _mcp_toggle(name, enabled=turn_on, project=project)
-                if ok:
+                turn_on = name not in _mcp_enabled_names()
+                if _mcp_toggle(name, enabled=turn_on):
                     # proses warm masih bawa set MCP lama → buang; respawn
                     # otomatis dgn config baru di pesan berikutnya
                     _WARM.discard_all()
+                    _MCP_CACHE["servers"] = None   # paksa health-check ulang
             _mcp_panel_refresh(cid, mid)
         return
 
@@ -6580,6 +6570,8 @@ def main():
     log(f"Owner IDs: {OWNER_IDS}")
     log(f"Model slot: {MODEL_SLOT}")
     log(f"Default workdir: {WORKDIR}")
+    if _ENV_LOADED:   # NAMA key saja — nilai tidak pernah di-log
+        log(f"Env dari ~/.claude/.env: {', '.join(sorted(_ENV_LOADED))}")
 
     # Register commands with Telegram (/ autocomplete)
     try:
