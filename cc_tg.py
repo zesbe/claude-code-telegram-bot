@@ -139,7 +139,10 @@ TELE_SYSTEM_PROMPT = CFG.get("system_prompt", (
     "[Q:multi]=boleh banyak; pertanyaan singkat & opsi maks ~50 char; taruh blok "
     "di AKHIR pesan, penjelasan sebelumnya. User juga bisa MENGETIK jawaban bebas "
     "per pertanyaan (tombol ✍️), jadi tak perlu opsi 'lainnya'. "
-    "Kalau cuma SATU pertanyaan → tetap pakai PICK/MULTIPICK biasa.\n\n"
+    "Kalau cuma SATU pertanyaan → tetap pakai PICK/MULTIPICK biasa. "
+    "PENTING: tag penutup HARUS sama dengan pembuka — [[FORM]] ditutup "
+    "[[/FORM]], [[PICK]] ditutup [[/PICK]], [[MULTIPICK]] ditutup "
+    "[[/MULTIPICK]]. JANGAN campur (mis. [[FORM]]…[[/PICK]]).\n\n"
     "PRESENTASI — data terstruktur: untuk perbandingan/daftar berkolom/rekap/angka, "
     "GUNAKAN tabel markdown (| kolom | kolom | lalu baris pemisah |---|). Bot "
     "merender tabel otomatis jadi kotak rapi (monospace) di Telegram. Beri baris "
@@ -1096,38 +1099,52 @@ def _split_pieces(body: str, max_pieces: int = 40) -> list:
                 pieces.append(para)
     return pieces[:max_pieces]
 
-def _parse_pick(text: str):
-    """Return (clean_text, [options]) if a PICK block exists, else (text, None)."""
-    m = _PICK_RE.search(text or "")
+# Penutup blok TOLERAN: model kadang salah nulis (mis. [[FORM]]…[[/PICK]]).
+# Tag PEMBUKA yang menentukan jenis; penutup boleh tag apa pun / hilang.
+_BLOCK_CLOSE_RE = re.compile(r"\[\[/\s*(?:FORM|PICK|MULTIPICK)\s*\]\]",
+                             re.IGNORECASE)
+
+def _has_choice_block(t: str) -> bool:
+    """Ada blok pilihan/form? Cek tag PEMBUKA saja — penutup bisa salah/hilang
+    (model pernah nulis [[FORM]]…[[/PICK]] → lolos mentah kalau cek regex penuh)."""
+    up = (t or "").upper()
+    return "[[PICK" in up or "[[MULTIPICK" in up or "[[FORM" in up
+
+def _extract_block(text: str, tag: str):
+    """Ambil isi blok [[TAG]]…[[/apapun]]. Return (clean_text, body|None).
+    Penutup salah ([[/PICK]] utk FORM) atau hilang (sampai akhir teks) tetap
+    diterima — biar tag mentah tak pernah bocor ke user."""
+    m = re.search(r"\[\[" + tag + r"\]\]", text or "", re.IGNORECASE)
     if not m:
         return text, None
-    options = []
-    for line in m.group(1).splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        # strip leading "1." / "1)" / "- " / "* "
-        line = re.sub(r"^\s*(?:\d+[.)]|[-*])\s*", "", line).strip()
+    rest = text[m.end():]
+    mc = _BLOCK_CLOSE_RE.search(rest)
+    body = rest[:mc.start()] if mc else rest
+    end = m.end() + (mc.end() if mc else len(rest))
+    clean = (text[:m.start()] + text[end:]).strip()
+    return clean, body
+
+def _opts_from(body: str) -> list:
+    opts = []
+    for line in (body or "").splitlines():
+        line = re.sub(r"^\s*(?:\d+[.)]|[-*])\s*", "", line.strip()).strip()
         if line:
-            options.append(line[:60])
-    clean = (text[:m.start()] + text[m.end():]).strip()
-    return clean, (options[:8] or None)
+            opts.append(line[:60])
+    return opts
+
+def _parse_pick(text: str):
+    """Return (clean_text, [options]) if a PICK block exists, else (text, None)."""
+    clean, body = _extract_block(text, "PICK")
+    if body is None:
+        return text, None
+    return clean, (_opts_from(body)[:8] or None)
 
 def _parse_multipick(text: str):
     """Return (clean_text, [options]) if a MULTIPICK block exists, else (text, None)."""
-    m = _MULTIPICK_RE.search(text or "")
-    if not m:
+    clean, body = _extract_block(text, "MULTIPICK")
+    if body is None:
         return text, None
-    options = []
-    for line in m.group(1).splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        line = re.sub(r"^\s*(?:\d+[.)]|[-*])\s*", "", line).strip()
-        if line:
-            options.append(line[:60])
-    clean = (text[:m.start()] + text[m.end():]).strip()
-    return clean, (options[:8] or None)
+    return clean, (_opts_from(body)[:8] or None)
 
 # ── FORM multi-pertanyaan (wizard ala AskUserQuestion di terminal) ───────────
 # Claude emit [[FORM]] [Q:multi] tanya? \n 1. opsi … [[/FORM]] → bot render
@@ -1138,12 +1155,13 @@ _pending_form: dict = {}   # (cid, tok) -> state wizard
 _form_await: dict = {}     # cid -> (tok, mid): nunggu jawaban KETIK utk form
 
 def _parse_form(text: str):
-    """Return (clean_text, questions|None); questions=[{q,multi,opts}] maks 4×8."""
-    m = _FORM_RE.search(text or "")
-    if not m:
+    """Return (clean_text, questions|None); questions=[{q,multi,opts}] maks 4×8.
+    Toleran penutup salah/hilang (via _extract_block)."""
+    clean, body = _extract_block(text, "FORM")
+    if body is None:
         return text, None
     qs, cur = [], None
-    for line in m.group(1).splitlines():
+    for line in body.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -1162,7 +1180,6 @@ def _parse_form(text: str):
             cur["opts"].append(opt[:60])
     if cur and cur["opts"]:
         qs.append(cur)
-    clean = (text[:m.start()] + text[m.end():]).strip()
     return clean, (qs[:4] or None)
 
 def _form_answer_of(st: dict, i: int):
@@ -5264,8 +5281,7 @@ class LiveStream:
                 elif kind == "seal":
                     tb_id, tb_lines, last_bash = None, [], False   # tutup batch tool
                     sid, txt = payload
-                    if (_PICK_RE.search(txt) or _MULTIPICK_RE.search(txt)
-                            or _FORM_RE.search(txt)):
+                    if _has_choice_block(txt):
                         # Blok pilihan/form dirender caller (tombol/wizard).
                         # Preview yg sempat tampil dihapus biar gak dobel.
                         if sid:
@@ -5460,8 +5476,7 @@ class LiveStream:
         # PICK/MULTIPICK → caller render tombol; bubble dikecilkan jadi footer.
         # Kalau edit footer gagal (rate-limit berat), fallback pesan baru — biar
         # gak nyangkut jadi teks streaming lama selamanya (kosmetik tapi bingungin).
-        if (_PICK_RE.search(result or "") or _MULTIPICK_RE.search(result or "")
-                or _FORM_RE.search(result or "")):
+        if _has_choice_block(result or ""):
             if self.st_id and not self._edit_md(footer):
                 _send_raw(self.cid, _to_md(footer), 0, self.thread_id)
             return False
