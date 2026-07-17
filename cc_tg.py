@@ -104,7 +104,18 @@ TELE_SYSTEM_PROMPT = CFG.get("system_prompt", (
     "[[/PICK]]\n"
     "Aturan blok PICK: taruh di AKHIR pesan, satu opsi per baris diawali angka, "
     "teks opsi singkat (maks ~50 char), maksimal 8 opsi. "
-    "Tulis pertanyaan/penjelasan SEBELUM blok. Jangan pakai blok ini kalau tidak menanyakan pilihan.\n\n"
+    "Tulis pertanyaan/penjelasan SEBELUM blok. Jangan pakai blok ini kalau tidak menanyakan pilihan.\n"
+    "OPSIONAL — DESKRIPSI OPSI: kalau sebuah opsi perlu penjelasan, tulis di "
+    "baris SETELAH opsi itu TANPA angka (baris tak-bernomor = penjelasan opsi di "
+    "atasnya, bukan opsi baru). Tombol tetap cuma judul opsi; penjelasan tampil "
+    "di teks. Contoh:\n"
+    "[[PICK]]\n"
+    "1. Semua perangkat LAN\n"
+    "   Semua device di subnet kena aturan\n"
+    "2. Device tertentu saja\n"
+    "   Cuma IP yang kamu sebut\n"
+    "[[/PICK]]\n"
+    "Ini berlaku sama untuk MULTIPICK & FORM.\n\n"
     "ATURAN PENTING — PILIH PICK vs MULTIPICK:\n"
     "• Kalau jawaban yang benar HANYA SATU (mutually exclusive, mis. 'pilih bahasa', "
     "'pakai opsi A atau B') → pakai [[PICK]].\n"
@@ -1101,20 +1112,21 @@ def _split_pieces(body: str, max_pieces: int = 40) -> list:
 
 # Penutup blok TOLERAN: model kadang salah nulis (mis. [[FORM]]…[[/PICK]]).
 # Tag PEMBUKA yang menentukan jenis; penutup boleh tag apa pun / hilang.
-_BLOCK_CLOSE_RE = re.compile(r"\[\[/\s*(?:FORM|PICK|MULTIPICK)\s*\]\]",
+# Semua regex toleran spasi dalam kurung: [[ PICK ]], [[/ form ]], dst.
+_BLOCK_CLOSE_RE = re.compile(r"\[\[\s*/\s*(?:FORM|PICK|MULTIPICK)\s*\]\]",
                              re.IGNORECASE)
+_CHOICE_OPEN_RE = re.compile(r"\[\[\s*(?:PICK|MULTIPICK|FORM)", re.IGNORECASE)
 
 def _has_choice_block(t: str) -> bool:
     """Ada blok pilihan/form? Cek tag PEMBUKA saja — penutup bisa salah/hilang
     (model pernah nulis [[FORM]]…[[/PICK]] → lolos mentah kalau cek regex penuh)."""
-    up = (t or "").upper()
-    return "[[PICK" in up or "[[MULTIPICK" in up or "[[FORM" in up
+    return bool(_CHOICE_OPEN_RE.search(t or ""))
 
 def _extract_block(text: str, tag: str):
     """Ambil isi blok [[TAG]]…[[/apapun]]. Return (clean_text, body|None).
     Penutup salah ([[/PICK]] utk FORM) atau hilang (sampai akhir teks) tetap
     diterima — biar tag mentah tak pernah bocor ke user."""
-    m = re.search(r"\[\[" + tag + r"\]\]", text or "", re.IGNORECASE)
+    m = re.search(r"\[\[\s*" + tag + r"\s*\]\]", text or "", re.IGNORECASE)
     if not m:
         return text, None
     rest = text[m.end():]
@@ -1125,22 +1137,49 @@ def _extract_block(text: str, tag: str):
     return clean, body
 
 def _opts_from(body: str) -> list:
-    opts = []
-    for line in (body or "").splitlines():
-        line = re.sub(r"^\s*(?:\d+[.)]|[-*])\s*", "", line.strip()).strip()
-        if line:
-            opts.append(line[:60])
-    return opts
+    """Parse opsi → list {label, desc}. Baris berpenanda (1. / - / •) = OPSI
+    baru; baris TANPA penanda = lanjutan DESKRIPSI opsi sebelumnya (persis
+    AskUserQuestion di terminal: tiap opsi punya label + penjelasan di bawah).
+    Fallback: kalau tak ada satupun baris berpenanda → tiap baris = 1 opsi."""
+    marked, has_marker = [], False
+    for raw in (body or "").splitlines():
+        s = raw.strip()
+        if not s:
+            continue
+        m = re.match(r"^(?:\d+[.)]|[-*•])\s+(.+)$", s)
+        if m:
+            has_marker = True
+            if len(marked) < 8:
+                marked.append({"label": m.group(1).strip()[:60], "desc": ""})
+        elif marked:                       # deskripsi lanjutan opsi terakhir
+            marked[-1]["desc"] = (marked[-1]["desc"] + " " + s).strip()[:140]
+    if not has_marker:
+        return [{"label": re.sub(r"^\s*(?:\d+[.)]|[-*•])\s*", "", l.strip())[:60],
+                 "desc": ""}
+                for l in (body or "").splitlines() if l.strip()][:8]
+    return marked
+
+def _opt_labels(opts: list) -> list:
+    return [o["label"] for o in (opts or [])]
+
+def _opts_body(opts: list) -> str:
+    """Daftar opsi bernomor + deskripsi (buat body PICK/MULTIPICK) — tombol
+    cuma muat label, deskripsi tampil di teks biar konteksnya tak hilang."""
+    out = []
+    for i, o in enumerate(opts or []):
+        out.append(f"*{i+1}. {o['label']}*"
+                   + (f"\n    _{o['desc']}_" if o.get("desc") else ""))
+    return "\n".join(out)
 
 def _parse_pick(text: str):
-    """Return (clean_text, [options]) if a PICK block exists, else (text, None)."""
+    """Return (clean_text, [{label,desc}]) if a PICK block exists, else (text, None)."""
     clean, body = _extract_block(text, "PICK")
     if body is None:
         return text, None
     return clean, (_opts_from(body)[:8] or None)
 
 def _parse_multipick(text: str):
-    """Return (clean_text, [options]) if a MULTIPICK block exists, else (text, None)."""
+    """Return (clean_text, [{label,desc}]) if a MULTIPICK block exists, else (text, None)."""
     clean, body = _extract_block(text, "MULTIPICK")
     if body is None:
         return text, None
@@ -1160,26 +1199,24 @@ def _parse_form(text: str):
     clean, body = _extract_block(text, "FORM")
     if body is None:
         return text, None
-    qs, cur = [], None
+    # Pisah body per pertanyaan [Q...], lalu tiap segmen di-parse _opts_from
+    # (biar deskripsi opsi ikut ke-capture, bukan jadi opsi palsu).
+    qs, cur_q, cur_body = [], None, []
+    def _flush():
+        if cur_q is not None:
+            opts = _opts_from("\n".join(cur_body))
+            if opts:
+                qs.append({"q": cur_q[0], "multi": cur_q[1], "opts": opts})
     for line in body.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        qm = re.match(r"^\[Q(?::(single|multi))?\]\s*(.+)$", line, re.IGNORECASE)
+        qm = re.match(r"^\s*\[Q(?::(single|multi))?\]\s*(.+)$", line, re.IGNORECASE)
         if qm:
-            if cur and cur["opts"]:
-                qs.append(cur)
-            cur = {"q": qm.group(2).strip()[:200],
-                   "multi": (qm.group(1) or "single").lower() == "multi",
-                   "opts": []}
-            continue
-        if cur is None:
-            continue
-        opt = re.sub(r"^\s*(?:\d+[.)]|[-*])\s*", "", line).strip()
-        if opt and len(cur["opts"]) < 8:
-            cur["opts"].append(opt[:60])
-    if cur and cur["opts"]:
-        qs.append(cur)
+            _flush()
+            cur_q = (qm.group(2).strip()[:200],
+                     (qm.group(1) or "single").lower() == "multi")
+            cur_body = []
+        elif cur_q is not None:
+            cur_body.append(line)
+    _flush()
     return clean, (qs[:4] or None)
 
 def _form_answer_of(st: dict, i: int):
@@ -1187,7 +1224,8 @@ def _form_answer_of(st: dict, i: int):
     if st["typed"][i]:
         return st["typed"][i]
     if st["sel"][i]:
-        return ", ".join(st["qs"][i]["opts"][j] for j in sorted(st["sel"][i]))
+        return ", ".join(st["qs"][i]["opts"][j]["label"]
+                         for j in sorted(st["sel"][i]))
     return None
 
 def _form_text(st: dict) -> str:
@@ -1208,6 +1246,12 @@ def _form_text(st: dict) -> str:
     else:
         lines.append("_boleh pilih lebih dari satu_" if q["multi"]
                      else "_pilih salah satu_")
+    # deskripsi opsi (kalau ada) tampil di teks — tombol cuma muat label
+    desc_lines = [f"  {oi+1}. *{o['label']}* — _{o['desc']}_"
+                  for oi, o in enumerate(q["opts"]) if o.get("desc")]
+    if desc_lines and not st.get("typing"):
+        lines.append("")
+        lines += desc_lines
     answered = [f"✔ {st['qs'][k]['q'][:34]} → *{_form_answer_of(st, k)[:42]}*"
                 for k in range(n) if k != i and _form_answer_of(st, k)]
     if answered:
@@ -1222,7 +1266,7 @@ def _form_kb(tok: str, st: dict) -> dict:
     for oi, opt in enumerate(q["opts"]):
         on = oi in st["sel"][i]
         pre = ("☑" if on else "☐") if q["multi"] else ("🔘" if on else "⚪")
-        rows.append([{"text": f"{pre} {opt[:36]}",
+        rows.append([{"text": f"{pre} {opt['label'][:36]}",
                       "callback_data": f"fm:t:{tok}:{i}:{oi}"}])
     nav = []
     if i > 0:
@@ -1285,13 +1329,15 @@ def send_with_pick(chat_id: int, text: str, reply_to: int = 0, thread_id: int = 
         tok = uuid.uuid4().hex[:8]
         _pending_multipick[(chat_id, tok)] = (mp_options, set(), [0])
         _cap_pending(_pending_multipick)
-        # Build toggle buttons with ☐ prefix
-        rows = [[{"text": f"☐ {opt[:38]}", "callback_data": f"mpick:{tok}:{i}"}]
+        # Build toggle buttons with ☐ prefix (label saja)
+        rows = [[{"text": f"☐ {opt['label'][:38]}", "callback_data": f"mpick:{tok}:{i}"}]
                 for i, opt in enumerate(mp_options)]
         # Add "Selesai" confirmation button
         rows.append([{"text": "✅ Selesai", "callback_data": f"mpdone:{tok}"}])
         kb = {"inline_keyboard": rows}
         body = clean_mp or "Pilih (bisa lebih dari satu):"
+        if any(o.get("desc") for o in mp_options):   # tampilkan deskripsi opsi
+            body += "\n\n" + _opts_body(mp_options)
         kw = {"chat_id": chat_id, "text": _to_md(body), "parse_mode": "MarkdownV2",
               "reply_markup": kb}
         if thread_id:
@@ -1313,10 +1359,12 @@ def send_with_pick(chat_id: int, text: str, reply_to: int = 0, thread_id: int = 
     tok = uuid.uuid4().hex[:8]
     _pending_pick[(chat_id, tok)] = options
     _cap_pending(_pending_pick)
-    rows = [[{"text": f"{i+1}. {opt[:40]}", "callback_data": f"pick:{tok}:{i}"}]
+    rows = [[{"text": f"{i+1}. {opt['label'][:40]}", "callback_data": f"pick:{tok}:{i}"}]
             for i, opt in enumerate(options)]
     kb = {"inline_keyboard": rows}
     body = clean or "Pilih salah satu:"
+    if any(o.get("desc") for o in options):       # tampilkan deskripsi opsi
+        body += "\n\n" + _opts_body(options)
     kw = {"chat_id": chat_id, "text": _to_md(body), "parse_mode": "MarkdownV2",
           "reply_markup": kb}
     if thread_id:
@@ -3211,7 +3259,7 @@ def handle_callback(cb: dict):
         # keadaan TERAKHIR yg dirender → toggle kerasa responsif, gak antre 1-1.
         ver[0] += 1
         my_ver = ver[0]
-        rows = [[{"text": f"{'☑️' if j in selected else '☐'} {opt[:38]}",
+        rows = [[{"text": f"{'☑️' if j in selected else '☐'} {opt['label'][:38]}",
                   "callback_data": f"mpick:{tok}:{j}"}]
                 for j, opt in enumerate(options)]
         rows.append([{"text": f"✅ Selesai ({len(selected)} dipilih)",
@@ -3248,8 +3296,8 @@ def handle_callback(cb: dict):
                 pass
             return
         _pending_multipick.pop((cid, tok), None)   # submit beneran → baru dilepas
-        # Build comma-separated selection
-        chosen = [options[i] for i in sorted(selected)]
+        # Build comma-separated selection (label saja)
+        chosen = [options[i]["label"] for i in sorted(selected)]
         choice_text = ", ".join(chosen)
         thread_id = cb["message"].get("message_thread_id", 0)
         try:
@@ -3282,7 +3330,7 @@ def handle_callback(cb: dict):
                 pass
             send_msg(cid, "⚠️ Pilihan kadaluarsa. Ketik jawabanmu langsung.")
             return
-        choice = options[idx]
+        choice = options[idx]["label"]
         thread_id = cb["message"].get("message_thread_id", 0)
         # Lock the chosen option into the message (remove buttons)
         try:
@@ -5132,12 +5180,11 @@ class LiveStream:
 
     @staticmethod
     def _strip_pick_live(t: str) -> str:
-        """Preview live dipotong di tag PICK/MULTIPICK — tag mentah jangan
-        pernah tampil ke user; blok pilihan dirender caller via tombol."""
-        up = (t or "").upper()
-        cuts = [i for i in (up.find("[[PICK"), up.find("[[MULTIPICK"),
-                            up.find("[[FORM")) if i >= 0]
-        return t[:min(cuts)] if cuts else t
+        """Preview live dipotong di tag PICK/MULTIPICK/FORM — tag mentah jangan
+        pernah tampil ke user; blok pilihan dirender caller via tombol.
+        Toleran spasi ([[ FORM ]]) — sama dgn gerbang deteksi."""
+        m = _CHOICE_OPEN_RE.search(t or "")
+        return t[:m.start()] if m else t
 
     def _seg_loop(self):
         while not self._stop.is_set():
