@@ -5262,9 +5262,10 @@ class LiveStream:
                 elif kind == "seal":
                     tb_id, tb_lines, last_bash = None, [], False   # tutup batch tool
                     sid, txt = payload
-                    if _PICK_RE.search(txt) or _MULTIPICK_RE.search(txt):
-                        # Blok pilihan dirender caller (tombol). Preview yg
-                        # sempat tampil dihapus biar gak dobel sama pesan tombol.
+                    if (_PICK_RE.search(txt) or _MULTIPICK_RE.search(txt)
+                            or _FORM_RE.search(txt)):
+                        # Blok pilihan/form dirender caller (tombol/wizard).
+                        # Preview yg sempat tampil dihapus biar gak dobel.
                         if sid:
                             try:
                                 tg_api("deleteMessage", chat_id=self.cid, message_id=sid)
@@ -5457,7 +5458,8 @@ class LiveStream:
         # PICK/MULTIPICK → caller render tombol; bubble dikecilkan jadi footer.
         # Kalau edit footer gagal (rate-limit berat), fallback pesan baru — biar
         # gak nyangkut jadi teks streaming lama selamanya (kosmetik tapi bingungin).
-        if _PICK_RE.search(result or "") or _MULTIPICK_RE.search(result or ""):
+        if (_PICK_RE.search(result or "") or _MULTIPICK_RE.search(result or "")
+                or _FORM_RE.search(result or "")):
             if self.st_id and not self._edit_md(footer):
                 _send_raw(self.cid, _to_md(footer), 0, self.thread_id)
             return False
