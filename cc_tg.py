@@ -1181,9 +1181,16 @@ def _form_text(st: dict) -> str:
         lines += [st["intro"], ""]
     done = sum(1 for k in range(n) if _form_answer_of(st, k))
     lines.append(f"📋 *Pertanyaan {i+1}/{n}* — {done}/{n} terjawab")
+    note = st.pop("note", None)   # peringatan sekali-tampil (mis. belum lengkap)
+    if note:
+        lines.append(note)
     lines.append(f"\n*{q['q']}*")
-    lines.append("_boleh pilih lebih dari satu_" if q["multi"]
-                 else "_pilih salah satu_")
+    if st.get("typing"):
+        lines.append("✍️ *MODE KETIK AKTIF* — pesan teks berikutnya yang kamu "
+                     "kirim = jawaban pertanyaan ini (tidak dikirim ke Claude).")
+    else:
+        lines.append("_boleh pilih lebih dari satu_" if q["multi"]
+                     else "_pilih salah satu_")
     answered = [f"✔ {st['qs'][k]['q'][:34]} → *{_form_answer_of(st, k)[:42]}*"
                 for k in range(n) if k != i and _form_answer_of(st, k)]
     if answered:
@@ -1207,10 +1214,14 @@ def _form_kb(tok: str, st: dict) -> dict:
         nav.append({"text": "➡️ Lanjut", "callback_data": f"fm:n:{tok}"})
     nav.append({"text": "✅ Kirim", "callback_data": f"fm:s:{tok}"})
     rows.append(nav)
-    rows.append([
-        {"text": "✍️ Ketik jawaban", "callback_data": f"fm:w:{tok}"},
-        {"text": "💬 Bahas dulu", "callback_data": f"fm:c:{tok}"},
-    ])
+    if st.get("typing"):
+        rows.append([{"text": "✖️ Batal mode ketik",
+                      "callback_data": f"fm:x:{tok}"}])
+    else:
+        rows.append([
+            {"text": "✍️ Ketik jawaban", "callback_data": f"fm:w:{tok}"},
+            {"text": "💬 Bahas dulu", "callback_data": f"fm:c:{tok}"},
+        ])
     return {"inline_keyboard": rows}
 
 def _form_render(cid: int, mid: int, tok: str):
@@ -3110,33 +3121,28 @@ def handle_callback(cb: dict):
             st["idx"] = min(n - 1, st["idx"] + 1)
             _form_render(cid, mid, tok)
         elif act == "w":
+            # JANGAN pakai answerCallbackQuery alert: callback sudah dijawab
+            # generik di atas handler → alert kedua ditolak Telegram diam2.
+            # Feedback lewat perubahan panel yang PASTI kelihatan.
+            st["typing"] = True
             _form_await[cid] = (tok, mid)
-            try:
-                tg_api("answerCallbackQuery", callback_query_id=cb_id,
-                       text=f"Ketik jawabanmu utk pertanyaan {st['idx']+1} — "
-                            f"pesan teks berikutnya masuk ke form.",
-                       show_alert=True)
-            except Exception:
-                pass
+            _form_render(cid, mid, tok)
+        elif act == "x":
+            st["typing"] = False
+            _form_await.pop(cid, None)
+            _form_render(cid, mid, tok)
         elif act == "c":
-            try:
-                tg_api("answerCallbackQuery", callback_query_id=cb_id,
-                       text="Silakan ketik pertanyaan/diskusimu ke Claude — "
-                            "form ini tetap bisa diisi setelahnya.",
-                       show_alert=True)
-            except Exception:
-                pass
+            thread_id = cb["message"].get("message_thread_id", 0)
+            send_msg(cid, "💬 Silakan langsung ketik pertanyaan/diskusimu ke "
+                          "Claude — form di atas tetap bisa diisi kapan saja.",
+                     thread_id=thread_id or 0)
         elif act == "s":
             blank = [k for k in range(n) if not _form_answer_of(st, k)]
             if blank:
                 st["idx"] = blank[0]
+                st["note"] = (f"⚠️ *Masih {len(blank)} pertanyaan belum "
+                              f"dijawab* — kubuka yang kosong di bawah.")
                 _form_render(cid, mid, tok)
-                try:
-                    tg_api("answerCallbackQuery", callback_query_id=cb_id,
-                           text=f"Masih {len(blank)} pertanyaan belum dijawab.",
-                           show_alert=True)
-                except Exception:
-                    pass
                 return
             _pending_form.pop((cid, tok), None)
             _form_await.pop(cid, None)
@@ -3444,13 +3450,9 @@ def handle_callback(cb: dict):
         slot = data.replace("set_", "")
         sess = load_sess(cid)
         if slot not in _model_slots_for(sess.get("provider")):
-            try:
-                tg_api("answerCallbackQuery", callback_query_id=cb_id,
-                       text="✨ Fable 5 cuma ada di provider claude (native). "
-                            "Pindah dulu: /provider claude",
-                       show_alert=True)
-            except Exception:
-                pass
+            # alert callback gak bisa (sudah dijawab generik di atas) → pesan biasa
+            send_msg(cid, "✨ `fable` cuma ada di provider *claude* (native).\n"
+                          "Pindah dulu: `/provider claude`, lalu pilih Fable lagi.")
             return
         sess["model"] = slot           # per-window ONLY — jangan sentuh global MODEL_SLOT
         save_sess(cid)
@@ -5601,6 +5603,7 @@ def process(upd: dict):
         if f_st:
             f_st["typed"][f_st["idx"]] = text.strip()[:300]
             f_st["sel"][f_st["idx"]] = set()
+            f_st["typing"] = False
             if f_st["idx"] < len(f_st["qs"]) - 1:
                 f_st["idx"] += 1
             _form_render(cid, f_mid, f_tok)
