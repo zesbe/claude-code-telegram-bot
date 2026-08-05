@@ -1025,6 +1025,21 @@ def _smart_chunks(text: str, hard_limit: int = 3500,
         safe[bi] = safe[bi] + "\n\n" + safe.pop(bi + 1)
     return safe
 
+# Reply keyboard (bar tombol bawah) gampang hilang dari sisi klien: ganti
+# device, clear cache/data, atau user tap "sembunyikan keyboard". Dulu hanya
+# dipasang saat /start → sekali hilang harus ketik /start lagi. Sekarang
+# di-refresh berkala dengan MENUMPANG pesan yang memang dikirim (tanpa bubble
+# tambahan). TTL panjang: cukup buat pulih, tak bikin payload tiap pesan.
+KB_REFRESH_TTL = int(CFG.get("kb_refresh_ttl", 10800))   # 3 jam
+_kb_at: dict = {}      # chat_id -> epoch terakhir keyboard dipasang
+
+def _kb_due(chat_id: int) -> bool:
+    return (time.time() - _kb_at.get(chat_id, 0)) > KB_REFRESH_TTL
+
+def _kb_mark(chat_id: int):
+    _kb_at[chat_id] = time.time()
+    _cap_pending(_kb_at, 200)
+
 def _send_raw(chat_id: int, md: str, reply_to: int = 0, thread_id: int = 0) -> dict:
     """Send MarkdownV2 text, chunked. Falls back to plain on parse error.
     Cek `d.get("ok")` eksplisit — tg_api BISA nyerah stlh retry 429 exhaust &
@@ -1041,6 +1056,10 @@ def _send_raw(chat_id: int, md: str, reply_to: int = 0, thread_id: int = 0) -> d
             kw["message_thread_id"] = thread_id
         if reply_to and i == 0:
             kw["reply_to_message_id"] = reply_to
+        # Numpang pasang ulang bar tombol (cuma sekali per TTL, di part pertama)
+        if i == 0 and chat_id > 0 and _kb_due(chat_id):
+            kw["reply_markup"] = REPLY_KB
+            _kb_mark(chat_id)
         plain_kw = dict(kw)
         plain_kw["text"] = re.sub(r'\\([_*\[\]()~`>#+\-=|{}.!\\])', r'\1', part)[:4096]
         plain_kw.pop("parse_mode", None)
@@ -4339,6 +4358,17 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
     a = parts[1].strip() if len(parts) > 1 else ""
     if c == "/start":
         return START_MSG
+    if c in ("/kb", "/keyboard", "/tombol"):
+        # Munculkan lagi bar tombol bawah kalau hilang (ganti HP, clear cache,
+        # atau ke-sembunyikan) — tanpa perlu /start ulang.
+        try:
+            tg_api("sendMessage", chat_id=cid, parse_mode="",
+                   text="⌨️ Tombol cepat dipasang ulang di bawah 👇",
+                   reply_markup=REPLY_KB)
+            _kb_mark(cid)
+        except Exception:
+            return "❌ Gagal memasang tombol. Coba /start."
+        return None
     if c == "/help":
         return HELP
     if c == "/exit":
@@ -6684,6 +6714,7 @@ def main():
         tg_api("setMyCommands", commands=[
             {"command": "help", "description": "❓ Panduan lengkap"},
             {"command": "menu", "description": "📋 Interactive menu"},
+            {"command": "kb", "description": "⌨️ Munculkan lagi tombol bawah"},
             {"command": "new", "description": "🆕 Window/sesi baru"},
             {"command": "resume", "description": "🔄 List/switch sessions"},
             {"command": "stop", "description": "⏹ Stop task berjalan"},
