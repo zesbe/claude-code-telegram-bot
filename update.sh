@@ -27,10 +27,30 @@ say "Ambil update dari origin/$BRANCH…"
 git fetch --quiet origin "$BRANCH" || die "git fetch gagal (cek koneksi)."
 
 NEW=$(git rev-parse --short "origin/$BRANCH")
+# PENGAMAN (2026-08-05): commit lokal yang BELUM di-push akan HILANG kalau
+# di-reset --hard (kejadian nyata: /update menghapus 11 commit fitur).
+# Kalau ada commit lokal / perubahan belum di-commit → STOP, jangan reset.
+AHEAD=$(git rev-list --count "origin/$BRANCH..HEAD" 2>/dev/null || echo 0)
+DIRTY=$(git status --porcelain 2>/dev/null | head -20)
+if [ "${AHEAD:-0}" -gt 0 ] || [ -n "$DIRTY" ]; then
+    warn "Update DIBATALKAN demi keamanan:"
+    [ "${AHEAD:-0}" -gt 0 ] && warn "  • ada $AHEAD commit lokal yang belum di-push ke GitHub"
+    [ -n "$DIRTY" ] && warn "  • ada perubahan file yang belum di-commit"
+    warn "  Reset ke versi GitHub akan MENGHAPUS pekerjaan itu."
+    warn "  Backup dulu:  cd $DIR && git bundle create ~/cctg-backup.bundle --all"
+    warn "  Lalu push:    git push origin $BRANCH"
+    warn "  Atau paksa (SADAR akan kehilangan): FORCE_UPDATE=1 $DIR/update.sh"
+    [ "${FORCE_UPDATE:-0}" = "1" ] || die "Ada pekerjaan lokal — update dihentikan."
+    warn "FORCE_UPDATE=1 → lanjut reset (pekerjaan lokal dibuang)."
+fi
+
 if [ "$OLD" = "$NEW" ]; then
     say "${B}Sudah versi terbaru${X} ($OLD). Tidak ada update."
     UPDATED=0
 else
+    # Safety net: simpan titik balik sebelum reset (dipulihkan via git reflog
+    # atau tag ini) — reset --hard membuang commit lokal yang tak ter-push.
+    git tag -f "pre-update-$(date +%Y%m%d-%H%M%S)" HEAD >/dev/null 2>&1 || true
     # Reset HANYA file tracked ke versi GitHub. config/providers/sessions
     # aman (gitignored, tidak ikut tracked). Edit lokal pada kode dibuang.
     say "Update $OLD → $NEW (reset file kode ke versi GitHub)…"
