@@ -4622,7 +4622,7 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
     if c == "/cd":
         if not a:
             return ("Cara pakai: `/cd /folder`\n"
-                    "Contoh: `/cd /home/zesbe/yudha-pay`")
+                    "Contoh: `/cd ~/proyek-saya`")
         p = Path(a).expanduser()
         if not p.is_absolute():
             p = Path(load_sess(cid)["workdir"]) / a

@@ -60,7 +60,7 @@ if [ -z "$choice" ]; then
     i=$((i+1))
   done
   echo "  ${CD}──────────────────────────────────────────────${C0}"
-  printf "  ${CD} q)  keluar${C0}\n\n"
+  printf '  %s q)  keluar%s\n\n' "$CD" "$C0"
   printf "  Pilih [1-%d]: " "${#NAMES[@]}"
   read -r choice || exit 0
 fi

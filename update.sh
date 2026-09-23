@@ -11,8 +11,8 @@ set -eu
 DIR="${INSTALL_DIR:-$HOME/.cc-tg}"
 BRANCH="${BRANCH:-main}"
 
-if [ -t 1 ]; then G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; D=$'\e[2m'; B=$'\e[1m'; X=$'\e[0m'
-else G=; Y=; R=; D=; B=; X=; fi
+if [ -t 1 ]; then G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; B=$'\e[1m'; X=$'\e[0m'
+else G=; Y=; R=; B=; X=; fi
 say(){ printf '%s\n' "${G}▶${X} $*"; }
 warn(){ printf '%s\n' "${Y}!${X} $*" >&2; }
 die(){ printf '%s\n' "${R}✗ $*${X}" >&2; exit 1; }

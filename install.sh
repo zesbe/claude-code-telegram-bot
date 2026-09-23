@@ -364,9 +364,11 @@ fi
 if [ -f "$INSTALL_DIR/claude-terminal.sh" ]; then
     BINDIR="$HOME/.local/bin"
     mkdir -p "$BINDIR"
-    install -m 755 "$INSTALL_DIR/claude-terminal.sh" "$BINDIR/claude-terminal" 2>/dev/null \
-        && ok "Wrapper terminal terpasang: ${C_BLD}claude-terminal${C_RST} (menu provider dari bot)" \
-        || warn "Gagal pasang claude-terminal (cek izin $BINDIR)"
+    if install -m 755 "$INSTALL_DIR/claude-terminal.sh" "$BINDIR/claude-terminal" 2>/dev/null; then
+        ok "Wrapper terminal terpasang: ${C_BLD}claude-terminal${C_RST} (menu provider dari bot)"
+    else
+        warn "Gagal pasang claude-terminal (cek izin $BINDIR)"
+    fi
     case ":$PATH:" in
         *":$BINDIR:"*) : ;;
         *) warn "$BINDIR belum di PATH — tambahkan: export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
