@@ -3271,6 +3271,57 @@ MENU_PROMPTS = {
     "m_disk":    ("📊 Disk",  "df -h . ; echo ; echo '— 10 folder terbesar —' ; du -sh ./* 2>/dev/null | sort -rh | head -10"),
 }
 
+# Exit NON-ZERO saat bot merestart dirinya: unit systemd (VPS & template
+# install.sh) pakai Restart=on-failure — exit 0 dianggap 'sukses' dan TIDAK
+# dihidupkan ulang (bug lama: /restart & /update bikin bot mati permanen).
+_RESTART_EXIT = 75   # EX_TEMPFAIL
+
+def _self_restart(delay: float = 1.5):
+    """Matikan bot dengan kode non-zero → systemd hidupkan ulang ±5 dtk."""
+    def _go():
+        time.sleep(delay)
+        log(f"Self-restart: exit {_RESTART_EXIT} → systemd menghidupkan ulang")
+        os._exit(_RESTART_EXIT)
+    threading.Thread(target=_go, daemon=True).start()
+
+def _run_update(cid: int):
+    """/update & tombol ⬇️ Update: jalankan update.sh lalu lapor + restart.
+    - CCTG_FROM_BOT=1 → skrip TIDAK me-restart service sendiri. Dulu
+      `sudo systemctl restart` dari dalam cgroup bot membunuh skrip + handler
+      sebelum sempat lapor (VPS), atau gagal minta password (laptop).
+    - Isi skrip dibaca ke memori (bash -c): `git reset` di tengah jalan
+      mengganti file yang sedang dibaca bash per-offset → eksekusi kacau.
+    - Restart dilakukan bot sendiri SETELAH lapor, hanya kalau ada update."""
+    up = BOT_DIR / "update.sh"
+    if not up.exists():
+        send_msg(cid, "❌ update.sh tidak ada. Update manual: `cd ~/.cc-tg && git pull`")
+        return
+    try:
+        env = os.environ.copy()
+        env["CCTG_FROM_BOT"] = "1"
+        env["INSTALL_DIR"] = str(BOT_DIR)
+        r = subprocess.run(["bash", "-c", up.read_text(encoding="utf-8"), "update.sh"],
+                           cwd=str(BOT_DIR), env=env,
+                           capture_output=True, text=True, timeout=180)
+    except subprocess.TimeoutExpired:
+        send_msg(cid, "⏰ Update timeout (>3 menit). Coba manual: `cd ~/.cc-tg && ./update.sh`")
+        return
+    except Exception as e:
+        send_msg(cid, f"❌ Update gagal: {str(e)[:200]}")
+        return
+    out = _strip_ansi((r.stdout or "") + (r.stderr or "")).strip()
+    tail = "\n".join(out.splitlines()[-10:])[:1500]
+    if r.returncode != 0:
+        # mis. pengaman: ada commit lokal belum di-push → sengaja dibatalkan
+        send_msg(cid, f"⚠️ *Update tidak dijalankan* — bot tetap versi sekarang.\n\n```\n{tail}\n```")
+        return
+    if "Sudah versi terbaru" in out:
+        send_msg(cid, f"✅ *Sudah versi terbaru* — tidak ada update.\n\n```\n{tail}\n```")
+        return
+    send_msg(cid, f"🔄 *Update selesai* — bot restart pakai versi baru (±5 dtk).\n\n```\n{tail}\n```")
+    log("Update selesai → self-restart")
+    _self_restart()
+
 def handle_callback(cb: dict):
     """Handle inline keyboard button press."""
     global MODEL_SLOT, PROVIDER
@@ -4096,33 +4147,14 @@ def handle_callback(cb: dict):
     elif data == "m_help":
         send_msg(cid, HELP)
     elif data == "m_update":
-        # Tombol Update → jalankan update.sh (pull GitHub + restart), async.
-        def _do_update_btn():
-            try:
-                up = BOT_DIR / "update.sh"
-                if not up.exists():
-                    send_msg(cid, "❌ update.sh tidak ada. Manual: `cd ~/.cc-tg && git pull`")
-                    return
-                r = subprocess.run(["bash", str(up)], cwd=str(BOT_DIR),
-                                   capture_output=True, text=True, timeout=180)
-                out = _strip_ansi((r.stdout or "") + (r.stderr or "")).strip()
-                tail = "\n".join(out.splitlines()[-8:])[:1200]
-                if "Sudah versi terbaru" in out:
-                    send_msg(cid, f"✅ *Sudah versi terbaru.*\n\n```\n{tail}\n```")
-                    return
-                send_msg(cid, f"🔄 *Update selesai* — bot restart pakai versi baru.\n\n```\n{tail}\n```")
-                time.sleep(1); os._exit(0)
-            except subprocess.TimeoutExpired:
-                send_msg(cid, "⏰ Update timeout (>3 menit).")
-            except Exception as e:
-                send_msg(cid, f"❌ Update gagal: {str(e)[:200]}")
+        # Tombol Update → update.sh (pull GitHub) lalu lapor + restart, async.
         try:
             tg_api("deleteMessage", chat_id=cid, message_id=mid)
         except Exception:
             pass
         send_msg(cid, "⬇️ Mengambil update dari GitHub… (tunggu ~10-30 detik)")
         log("Update requested via MENU button")
-        threading.Thread(target=_do_update_btn, daemon=True).start()
+        threading.Thread(target=_run_update, args=(cid,), daemon=True).start()
     elif data == "m_back":
         edit_md(cid, mid, "⚡ **Aksi cepat** — pilih di bawah:", reply_markup=MENU_KB)
     elif data in ("m_close", "close"):
@@ -5068,36 +5100,13 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
     if c == "/restart":
         send_msg(cid, "♻️ Merestart bot… (auto-up via systemd, ~5 detik)")
         log("Restart requested via /restart")
-        threading.Thread(target=lambda: (time.sleep(1), os._exit(0)), daemon=True).start()
+        _self_restart()        # exit NON-zero → Restart=on-failure menghidupkan ulang
         return None
     if c == "/update":
-        # Pull versi terbaru dari GitHub lalu restart. update.sh sudah handle:
-        # reset file kode ke origin/main (config/providers aman, gitignored) +
-        # sinkron deps + restart service. Dijalankan async biar /update langsung balas.
-        def _do_update():
-            try:
-                up = BOT_DIR / "update.sh"
-                if not up.exists():
-                    send_msg(cid, "❌ update.sh tidak ada. Update manual: `cd ~/.cc-tg && git pull`")
-                    return
-                r = subprocess.run(["bash", str(up)], cwd=str(BOT_DIR),
-                                   capture_output=True, text=True, timeout=180)
-                out = _strip_ansi((r.stdout or "") + (r.stderr or "")).strip()
-                tail = "\n".join(out.splitlines()[-8:])[:1200]
-                if "Sudah versi terbaru" in out:
-                    send_msg(cid, f"✅ *Sudah versi terbaru* — tidak ada update.\n\n```\n{tail}\n```")
-                    return
-                send_msg(cid, f"🔄 *Update selesai* — bot akan restart pakai versi baru.\n\n```\n{tail}\n```")
-                # restart kalau update.sh belum (mis. bukan systemd) — exit, systemd auto-up
-                time.sleep(1)
-                os._exit(0)
-            except subprocess.TimeoutExpired:
-                send_msg(cid, "⏰ Update timeout (>3 menit). Coba manual: `cd ~/.cc-tg && ./update.sh`")
-            except Exception as e:
-                send_msg(cid, f"❌ Update gagal: {str(e)[:200]}")
+        # Pull versi terbaru dari GitHub (update.sh) → lapor → restart sendiri.
         send_msg(cid, "⬇️ Mengambil update dari GitHub… (tunggu ~10-30 detik)")
         log("Update requested via /update")
-        threading.Thread(target=_do_update, daemon=True).start()
+        threading.Thread(target=_run_update, args=(cid,), daemon=True).start()
         return None
     if c == "/retry":
         # Kirim ulang pesan terakhir user di window ini
