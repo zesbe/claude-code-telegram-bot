@@ -1689,6 +1689,12 @@ def _agentview_text(cid: int) -> str:
             state = "🔥 siap — respon ~1 dtk"
         else:
             state = "⚪ idle"
+        # Kerja di luar giliran pesan: task background & laporan otomatisnya
+        if _WARM.auto_active(sid):
+            extra.append("   🔔 lagi mengirim laporan task background")
+        nbg = _WARM.bg_count(sid)
+        if nbg:
+            extra.append(f"   🌙 {nbg} task background masih jalan")
         here = "  ← *kamu di sini*" if name == active else ""
         title = titles.get(sid, "")
         head = f"*{name}*" + (f" — _{title[:36]}_" if title else "")
@@ -2237,6 +2243,7 @@ def _act_track(lock_key, ev: dict):
 WARM_ENABLED = bool(CFG.get("warm_pool", True))
 WARM_TTL = int(CFG.get("warm_ttl", 900))   # dtk idle sebelum proses dimatikan
 WARM_MAX = int(CFG.get("warm_max", 3))     # maks proses hidup (≈300MB RAM/proses)
+WARM_BG_MAX = int(CFG.get("warm_bg_max", 10800))  # dtk: batas tunggu proses yg masih pegang task background
 
 class _WarmCancelled(Exception):
     pass
@@ -2335,8 +2342,44 @@ def _handle_stream_ev(ev: dict, holder: dict, _emit):
                 _emit({"type": "stream_think", "text": holder["think_buf"]})
     _emit(ev)
 
+def _win_for_session(cid: int, session_id: str):
+    """(nama window, thread_id topic, verbose) yang memegang session_id ini —
+    dipakai merender turn OTOMATIS ke tempat yang benar (topic forum ikut)."""
+    try:
+        store = _load_store(cid)
+    except Exception:
+        return None, 0, False
+    for name, w in (store.get("windows") or {}).items():
+        if w.get("session_id") != session_id:
+            continue
+        thread = 0
+        for tid, wn in (store.get("topic_map") or {}).items():
+            if wn == name:
+                try:
+                    thread = int(tid)
+                except (TypeError, ValueError):
+                    thread = 0
+                break
+        return name, thread, bool(w.get("verbose", False))
+    return None, 0, False
+
 class _WarmProc:
-    """Satu proses claude persistent untuk satu sesi."""
+    """Satu proses claude persistent untuk satu sesi.
+
+    SATU reader permanen membaca stdout sepanjang umur proses & merutekan
+    tiap event (dulu reader per-turn yang berhenti di `result`):
+    • turn MILIK KITA = dari echo pesan kita (--replay-user-messages, uuid
+      cocok) s/d `result` berikutnya → on_event caller (LiveStream pesan itu).
+    • turn OTOMATIS   = turn yang dimulai CLI sendiri, mis. task background
+      selesai (task_notification) → dirender LANGSUNG ke chat/topic pemilik
+      sesi, gaya sama dengan jawaban biasa.
+    BUG LAMA (2026-09-23): turn otomatis tak ada yang baca → nyangkut di pipa
+    → terbaca sbg 'jawaban' pesan BERIKUTNYA (geser satu terus). Gejala user:
+    pesan panjang telat, baru muncul saat dipancing pesan baru.
+    Fakta CLI (probe): echo keluar saat pesan BENAR-BENAR diproses (bukan saat
+    dibaca stdin); pesan yang masuk saat turn lain jalan bisa DISISIPKAN di
+    batas tool turn itu → jawabannya gabung di result turn tersebut."""
+
     def __init__(self, chat_id, workdir, session_id, provider, model, effort):
         self.chat_id = chat_id
         self.workdir = workdir
@@ -2344,9 +2387,16 @@ class _WarmProc:
         self.provider = provider
         self.model = model
         self.effort = effort
-        self.last_used = time.time()
-        self.turn_lock = threading.Lock()   # 1 turn pada satu waktu per proses
+        self.last_used = time.time()       # aktivitas terakhir (event apa pun)
+        self.turn_lock = threading.Lock()  # 1 turn milik kita pada satu waktu
+        self._rlock = threading.Lock()     # state routing (_turn)
+        self._wlock = threading.Lock()     # tulis stdin (turn/interrupt) tak tindih
+        self._turn = None                  # turn MILIK KITA yang sedang ditunggu
+        self._auto = None                  # turn OTOMATIS (disentuh reader saja)
+        self.bg_tasks = 0                  # task background yang masih jalan
+        self.dead = threading.Event()
         self.proc = self._spawn()
+        threading.Thread(target=self._reader_loop, daemon=True).start()
 
     def _spawn(self):
         env = os.environ.copy()
@@ -2366,6 +2416,8 @@ class _WarmProc:
                "--output-format", "stream-json",
                "--input-format", "stream-json",
                "--verbose", "--include-partial-messages",
+               # echo pesan kita (isReplay + uuid) = batas turn yang PASTI
+               "--replay-user-messages",
                "--append-system-prompt", TELE_SYSTEM_PROMPT]
         if self.effort and self.effort in EFFORT_LEVELS:
             cmd += ["--effort", self.effort]
@@ -2377,7 +2429,12 @@ class _WarmProc:
                                 stderr=subprocess.DEVNULL, start_new_session=True)
 
     def alive(self):
-        return self.proc.poll() is None
+        return self.proc.poll() is None and not self.dead.is_set()
+
+    def busy(self) -> bool:
+        """Ada turn jalan (milik kita / otomatis) → jangan di-evict/janitor."""
+        a = self._auto
+        return self._turn is not None or bool(a and a.get("ls"))
 
     def matches(self, workdir, provider, model, effort):
         return (self.workdir == workdir and self.provider == provider
@@ -2389,26 +2446,176 @@ class _WarmProc:
         except Exception:
             pass
 
-    def interrupt(self) -> bool:
-        """Setop turn berjalan TANPA bunuh proses (setara ESC di terminal).
-        CLI balas control_response + result subtype=error_during_execution,
-        proses tetap hidup — VERIFIED CLI 2.1.206. Return False = stdin putus."""
+    def _write(self, obj) -> bool:
         try:
-            self.proc.stdin.write((json.dumps(
-                {"type": "control_request",
-                 "request_id": f"intr-{int(time.time()*1000)}",
-                 "request": {"subtype": "interrupt"}}) + "\n").encode())
-            self.proc.stdin.flush()
+            with self._wlock:
+                self.proc.stdin.write((json.dumps(obj) + "\n").encode())
+                self.proc.stdin.flush()
             return True
         except Exception:
             return False
 
+    def interrupt(self) -> bool:
+        """Setop turn berjalan TANPA bunuh proses (setara ESC di terminal).
+        CLI balas control_response + result subtype=error_during_execution,
+        proses tetap hidup — VERIFIED CLI 2.1.206. Return False = stdin putus."""
+        return self._write({"type": "control_request",
+                            "request_id": f"intr-{int(time.time()*1000)}",
+                            "request": {"subtype": "interrupt"}})
+
+    def interrupt_auto(self) -> bool:
+        """/stop saat turn OTOMATIS jalan (tak ada turn milik kita)."""
+        a = self._auto
+        if self._turn is None and a and a.get("ls"):
+            return self.interrupt()
+        return False
+
+    # ── reader permanen + routing ────────────────────────────────────────────
+    def _reader_loop(self):
+        try:
+            for raw in self.proc.stdout:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                try:
+                    self._route(ev)
+                except Exception as e:
+                    log(f"warm route error ({self.session_id[:8]}): {e}")
+        except Exception:
+            pass
+        finally:
+            self.dead.set()
+            with self._rlock:
+                tc, self._turn = self._turn, None
+            auto, self._auto = self._auto, None
+            if tc is not None:
+                tc["done"].set()     # got_result False → caller: cancel / fallback
+            if auto is not None:
+                self._auto_close(auto, None)
+
+    def _route(self, ev):
+        t = ev.get("type")
+        self.last_used = time.time()
+        if t == "system" and ev.get("subtype") == "background_tasks_changed":
+            self.bg_tasks = len(ev.get("tasks") or [])
+        interrupted_auto = None
+        with self._rlock:
+            tc = self._turn
+            if t == "user" and ev.get("isReplay"):
+                if (tc is not None and not tc["started"]
+                        and ev.get("uuid") == tc["uuid"]):
+                    tc["started"] = True          # mulai detik ini: milik kita
+                    tc["t_start"] = time.time()
+                    interrupted_auto, self._auto = self._auto, None
+                target = None                     # echo tak diteruskan ke UI
+            elif tc is not None and tc["started"]:
+                target = tc
+            else:
+                target = "auto"
+        if interrupted_auto is not None:
+            # pesan user disisipkan ke turn otomatis yang lagi jalan → sisa
+            # turn itu (termasuk jawabannya) jadi milik kita; tutup yg otomatis
+            self._auto_close(interrupted_auto, None)
+        if target is None:
+            return
+        if target == "auto":
+            self._auto_event(ev)
+            return
+        _handle_stream_ev(ev, target["holder"], target["emit"])
+        if t == "result":
+            with self._rlock:
+                target["got_result"] = True
+                if self._turn is target:
+                    self._turn = None             # event berikut = otomatis
+            target["done"].set()
+
+    # ── turn OTOMATIS: render sendiri ke chat pemilik sesi ───────────────────
+    def _auto_event(self, ev):
+        a = self._auto
+        if a is None:
+            # Event pra-turn (hook/init/status) turn MILIK KITA sebelum echo
+            # juga lewat sini — tanpa konten, tak pernah membuka LiveStream.
+            a = {"holder": {"result": "", "usage": {}}, "ls": None,
+                 "summary": "", "thread": 0}
+            self._auto = a
+        t, st = ev.get("type"), ev.get("subtype")
+        if t == "system" and st == "task_notification":
+            s = " ".join((ev.get("summary") or "").split())
+            if s:
+                a["summary"] = s[:200]
+        content = (t in ("assistant", "stream_event")
+                   or (t == "system" and st == "task_notification"))
+        if a["ls"] is None and content:
+            a["ls"] = self._auto_open(a)
+        emit = a["ls"].on_event if a["ls"] else (lambda e: None)
+        _handle_stream_ev(ev, a["holder"], emit)
+        if t == "result":
+            self._auto = None
+            self._auto_close(a, ev)
+
+    def _auto_open(self, a):
+        name, thread, verbose = _win_for_session(self.chat_id, self.session_id)
+        a["thread"] = thread
+        ls = LiveStream(self.chat_id, thread, name or "background",
+                        self.provider, self.model, verbose,
+                        (self.chat_id, name or "?"), time.time())
+        ls.start()
+        head = "🔔 **Laporan task background** — Claude lanjut tanpa diminta"
+        if a.get("summary"):
+            head += f"\n_{a['summary']}_"
+        ls.note(head)
+        log(f"🔔 turn otomatis mulai (sesi {self.session_id[:8]}) → chat {self.chat_id}")
+        return ls
+
+    def _auto_close(self, a, res_ev):
+        ls = a.get("ls")
+        if ls is None:
+            return             # event pra-turn / tanpa konten → tak ada yang dikirim
+        holder = a["holder"]
+        cid, thread = self.chat_id, a.get("thread", 0)
+        provider = self.provider
+
+        def _fin():
+            try:
+                if res_ev is None:
+                    # disela pesan user / proses mati: segmen yang sudah
+                    # tersegel sudah terkirim; sisanya lanjut di turn user.
+                    ls.abort()
+                    return
+                if res_ev.get("subtype") != "success":
+                    ls.abort("⏹ Task background dihentikan.")
+                    return
+                result = _strip_ansi(holder.get("result") or "")
+                usage = holder.get("usage") or {}
+                if usage:
+                    slot = _usage_log.setdefault(provider or PROVIDER,
+                                                 {"tokens": 0, "cost": 0.0, "calls": 0})
+                    slot["tokens"] += usage.get("tokens", 0)
+                    slot["cost"] += usage.get("cost", 0)
+                    slot["calls"] += 1
+                if not result:
+                    ls.abort()
+                    return
+                if not ls.finalize(result, usage):
+                    if not send_with_pick(cid, result, thread_id=thread):
+                        send_msg(cid, result, thread_id=thread)
+            except Exception as e:
+                log(f"turn otomatis gagal dikirim: {e}")
+        # Thread terpisah: kirim ke Telegram bisa lambat (rate limit) — reader
+        # WAJIB terus menguras stdout (pipa penuh → CLI macet).
+        threading.Thread(target=_fin, daemon=True).start()
+
+    # ── turn MILIK KITA ──────────────────────────────────────────────────────
     def run_turn(self, prompt, on_event, lock_key):
-        """Kirim 1 pesan via stdin, baca event sampai `result` (proses TETAP
-        hidup buat turn berikutnya). Raise: _WarmCancelled (di-/stop),
+        """Kirim 1 pesan via stdin, tunggu `result` MILIK pesan ini (proses
+        TETAP hidup buat turn berikutnya). Raise: _WarmCancelled (di-/stop),
         _WarmTimeout, RuntimeError (proses/stdin mati → caller fallback cold)."""
         # /stop bisa lepas _busy lebih dulu → pesan baru masuk saat turn lama
-        # masih beres-beres pasca-interrupt. Lock cegah 2 reader di stdout sama.
+        # masih beres-beres pasca-interrupt. Lock: 1 turn milik kita per proses.
         if not self.turn_lock.acquire(timeout=15):
             self.kill()
             raise RuntimeError("warm proc masih sibuk turn sebelumnya")
@@ -2424,64 +2631,63 @@ class _WarmProc:
                     on_event(e)
                 except Exception:
                     pass
-        msg = {"type": "user", "message": {"role": "user",
-               "content": [{"type": "text", "text": prompt}]}}
-        try:
-            self.proc.stdin.write((json.dumps(msg) + "\n").encode())
-            self.proc.stdin.flush()
-        except Exception as e:
-            raise RuntimeError(f"warm stdin putus: {e}")
+        if not self.alive():
+            raise RuntimeError("warm proc sudah mati")
+        u = str(uuid.uuid4())
+        tc = {"uuid": u, "holder": {"result": "", "usage": {}}, "emit": _emit,
+              "started": False, "t_start": 0.0, "done": threading.Event(),
+              "got_result": False}
+        with self._rlock:
+            self._turn = tc      # daftar DULU baru kirim → echo cepat tak lolos
+        msg = {"type": "user", "uuid": u,
+               "message": {"role": "user",
+                           "content": [{"type": "text", "text": prompt}]}}
+        if not self._write(msg):
+            with self._rlock:
+                if self._turn is tc:
+                    self._turn = None
+            raise RuntimeError("warm stdin putus")
         self.last_used = time.time()
-
-        holder = {"result": "", "usage": {}}
-        done = threading.Event()
-        got = {"result": False}
-
-        def _reader():
-            try:
-                for raw in self.proc.stdout:
-                    line = raw.decode("utf-8", "replace").strip()
-                    if not line:
-                        continue
-                    try:
-                        ev = json.loads(line)
-                    except Exception:
-                        continue
-                    _handle_stream_ev(ev, holder, _emit)
-                    if ev.get("type") == "result":
-                        got["result"] = True
-                        return      # SISAKAN stdout untuk turn berikutnya
-            finally:
-                done.set()
-
-        t = threading.Thread(target=_reader, daemon=True)
-        t.start()
-        start = time.time()
+        t_sent = time.time()
         intr_at = 0.0
-        while not done.is_set():
-            if lock_key is not None and lock_key in _cancelled:
-                # GRACEFUL: interrupt dulu (turn berhenti, proses+MCP tetap
-                # hidup → pesan berikutnya tetap warm ~1 dtk). Kill hanya
-                # kalau interrupt gak mempan 10 dtk / stdin sudah putus.
-                if not intr_at:
-                    intr_at = time.time()
-                    if not self.interrupt():
+        intr_after_start = False
+        try:
+            while not tc["done"].is_set():
+                if lock_key is not None and lock_key in _cancelled:
+                    # GRACEFUL: interrupt (turn berhenti, proses+MCP tetap hidup).
+                    # Kalau pesan kita masih antre di belakang turn otomatis,
+                    # interrupt pertama kena turn itu → begitu pesan kita mulai
+                    # diproses (echo), interrupt lagi. Kill kalau 10 dtk mentok.
+                    if not intr_at:
+                        intr_at = time.time()
+                        intr_after_start = tc["started"]
+                        if not self.interrupt():
+                            self.kill()
+                    elif tc["started"] and not intr_after_start:
+                        intr_after_start = True
+                        if not self.interrupt():
+                            self.kill()
+                    elif time.time() - intr_at > 10:
                         self.kill()
-                elif time.time() - intr_at > 10:
+                # timeout dihitung sejak pesan kita MULAI diproses — antre di
+                # belakang turn otomatis tak memotong jatah (tetap dicap)
+                if time.time() - (tc["t_start"] or t_sent) > CLAUDE_TIMEOUT:
                     self.kill()
-            if time.time() - start > CLAUDE_TIMEOUT:
-                self.kill()
-                raise _WarmTimeout()
-            done.wait(0.3)
+                    raise _WarmTimeout()
+                tc["done"].wait(0.3)
+        finally:
+            with self._rlock:
+                if self._turn is tc:
+                    self._turn = None
         # Handler /stop lama bisa kill proses DULUAN (via _running_procs)
         # sebelum loop lihat _cancelled → reader EOF. Cek lagi di sini supaya
         # cancel TIDAK dianggap crash (crash = fallback cold = prompt jalan 2x).
         if lock_key is not None and lock_key in _cancelled:
             raise _WarmCancelled()
-        if not got["result"]:
+        if not tc["got_result"]:
             raise RuntimeError("warm proc berakhir tanpa result")
         self.last_used = time.time()
-        return _strip_ansi(holder["result"]), holder["usage"]
+        return _strip_ansi(tc["holder"]["result"]), tc["holder"]["usage"]
 
 class _WarmPool:
     def __init__(self):
@@ -2499,7 +2705,12 @@ class _WarmPool:
                 wp = None
             if wp is None:
                 while len(self._procs) >= WARM_MAX:
-                    oldest = min(self._procs.values(), key=lambda w: w.last_used)
+                    # korbankan yang nganggur dulu — jangan bunuh proses yang
+                    # masih pegang task background / turn jalan
+                    idle = [w for w in self._procs.values()
+                            if not w.busy() and w.bg_tasks == 0]
+                    oldest = min(idle or list(self._procs.values()),
+                                 key=lambda w: w.last_used)
                     oldest.kill()
                     self._procs.pop(oldest.session_id, None)
                 wp = _WarmProc(chat_id, workdir, session_id,
@@ -2534,13 +2745,42 @@ class _WarmPool:
             wp = self._procs.get(session_id)
             return bool(wp and wp.alive())
 
+    def bg_count(self, session_id) -> int:
+        """Jumlah task background yang masih jalan di proses sesi ini."""
+        with self._lock:
+            wp = self._procs.get(session_id)
+            return wp.bg_tasks if (wp and wp.alive()) else 0
+
+    def auto_active(self, session_id) -> bool:
+        """Lagi merender turn OTOMATIS (laporan task background)?"""
+        with self._lock:
+            wp = self._procs.get(session_id)
+        a = wp._auto if wp else None
+        return bool(a and a.get("ls"))
+
+    def interrupt_auto(self, chat_id) -> int:
+        """/stop: hentikan turn OTOMATIS yang jalan di chat ini."""
+        with self._lock:
+            procs = [w for w in self._procs.values() if w.chat_id == chat_id]
+        return sum(1 for w in procs if w.interrupt_auto())
+
     def _janitor(self):
         while True:
             time.sleep(60)
             now = time.time()
             with self._lock:
-                stale = [sid for sid, w in self._procs.items()
-                         if (not w.alive()) or now - w.last_used > WARM_TTL]
+                stale = []
+                for sid, w in self._procs.items():
+                    idle = now - w.last_used
+                    if not w.alive():
+                        stale.append(sid)
+                    elif w.busy() or w.bg_tasks > 0:
+                        # task background / turn masih jalan → biarkan (laporan
+                        # hasilnya jangan hilang), kecuali macet ekstrem
+                        if idle > WARM_BG_MAX:
+                            stale.append(sid)
+                    elif idle > WARM_TTL:
+                        stale.append(sid)
                 for sid in stale:
                     self._procs[sid].kill()
                     self._procs.pop(sid, None)
@@ -4710,6 +4950,10 @@ def cmd(cid: int, text: str, msg: dict = None) -> str | None:
                 if p and not _WARM.owns(p):
                     try: _kill_process_tree(p)
                     except Exception: pass
+            # Turn OTOMATIS (laporan task background) tak tercatat di _busy —
+            # hentikan juga via interrupt (proses warm tetap hidup).
+            if _WARM.interrupt_auto(cid):
+                return "⏹ Laporan task background dihentikan."
             return ("⏹ Tidak ada task aktif. (State sudah dibersihkan.)"
                     if stray else "Tidak ada task yang sedang jalan.")
         killed = []
